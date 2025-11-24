@@ -5,11 +5,14 @@
 int main(int argc, char *argv[]) {
   // Flush after every printf
   setbuf(stdout, NULL);
-
-  printf("$ ");
   char command[1024];
-  fgets(command, 1024, stdin);
-  command[strlen(command) - 1] = '\0';
-  printf("%s: command not found", command);
+
+  for (;;)
+  {
+    printf("$ ");
+    fgets(command, 1024, stdin);
+    command[strlen(command) - 1] = '\0';
+    printf("%s: command not found\n", command);
+  }
   return 0;
 }
