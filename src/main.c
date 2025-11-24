@@ -2,14 +2,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-char *builtins[3] = {"echo\n", "type\n", "exit\n"};
+char *builtins[3] = {"echo", "type", "exit"};
 
 void handle_type(char *line, int len) {
+  line[len - 1] = '\0';
   if (len == 5) {
     for (int i = 0; i < sizeof(builtins) / sizeof(builtins[0]); ++i)
     {
       if (strcmp(line, builtins[i]) == 0) {
-        line[len - 1] = '\0';
         printf("%s is a shell builtin\n", line);
         return;
       }
