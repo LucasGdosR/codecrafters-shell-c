@@ -49,7 +49,6 @@ void handle_type(str *string) {
           strcpy(full_path, dir_str);
           full_path[path_len] = '/';
           strcpy(full_path + path_len + 1, string->data);
-          printf("%s\n", full_path);
           if (access(full_path, X_OK) == 0) {
             printf("%s is %s\n", string->data, full_path);
             return;
