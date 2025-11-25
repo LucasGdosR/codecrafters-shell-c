@@ -92,7 +92,9 @@ int main(int argc, char *argv[])
       buffer.data[len - 1] = '\0';
       // We only handle full paths for now
       if (len > 3) {
-        if (chdir(buffer.data + 3))
+        if (buffer.data[3] == '~')
+          chdir(getenv("HOME"));
+        else if (chdir(buffer.data + 3))
         {
           printf("cd: %s: No such file or directory\n", buffer.data+3);
         }
