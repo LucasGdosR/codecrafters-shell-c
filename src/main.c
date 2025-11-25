@@ -39,6 +39,7 @@ typedef struct arena {
 =================================================================================================*/
 
 enum Builtins {
+  CD,
   PWD,
   Echo,
   Type,
@@ -51,7 +52,7 @@ enum Builtins {
 =================================================================================================*/
 
 str PATH;
-char *builtins[] = {[PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
+char *builtins[] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
 
 /*=================================================================================================
   FUNCTIONS
@@ -84,8 +85,23 @@ int main(int argc, char *argv[])
       break;
 
     // Eval-Print: builtins:
+    // cd
+    if ((*((short *)buffer.data) == 25699) // cd == 25699
+      && (buffer.data[2] == ' ' || buffer.data[2] == '\n'))
+    {
+      buffer.data[len - 1] = '\0';
+      // We only handle full paths for now
+      if (len > 3) {
+        if (chdir(buffer.data + 3))
+        {
+          printf("cd: %s: No such file or directory\n", buffer.data+3);
+        }
+      } else {
+        // blank case
+      }
+    }
     // pwd
-    if (len == 4 && strcmp(buffer.data, "pwd\n") == 0)
+    else if (len == 4 && strcmp(buffer.data, "pwd\n") == 0)
     {
       char *cwd = arena_push_string(&temp_allocator, MAX_CWD_SIZE);
       getcwd(cwd, MAX_CWD_SIZE);
