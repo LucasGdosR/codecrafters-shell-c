@@ -275,7 +275,7 @@ args* reset_arena_and_parse_args(arena *allocator)
       if ((c = *right++) != '\'')
         *left++ = c;
 
-    *(left - 1) = '\0';
+    *left = '\0';
   }
   *((char **)arena_push(allocator, alignof(char**), sizeof(char**))) = start;
   count++;
