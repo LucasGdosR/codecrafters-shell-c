@@ -228,7 +228,10 @@ args* reset_arena_and_parse_args(arena *allocator)
         break;
       case '"':
         edge_case[edge_cases++] = '"';
-        while (end < bound && *end++ != '"');
+        int escape_this = 0;
+        while (end < bound && *end != '"' || escape_this)
+          escape_this = *end++ == '\\' && !escape_this;
+        end++;
         break;
       case '\'':
         edge_case[edge_cases++] = '\'';
