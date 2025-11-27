@@ -213,53 +213,81 @@ args* reset_arena_and_parse_args(arena *allocator)
     return args;
   }
 
-    char *start = string.data, *end = string.data, *bound = string.data + string.len;
-    size_t count = 0; // Keep count of tokens for `args->c`.
-    char edge_case = 0; // Slow track dealing with quotes.
-    while (end < bound)
+  char *start = string.data, *end = string.data, *bound = string.data + string.len;
+  size_t count = 0; // Keep count of tokens for `args->c`.
+  #define MAX_EDGE_CASES 64
+  char edge_case[MAX_EDGE_CASES]; // Slow track dealing with quotes.
+  int edge_cases = 0;
+  while (end < bound)
+  {
+    switch (*end++) // Advance parser.
     {
-      switch (*end++) // Advance parser.
-      {
-        case '"':
-          edge_case = '"';
-          while (end < bound && *end++ != '"');
-          break;
-        case '\'':
-          edge_case = '\'';
-          while (end < bound && *end++ != '\'');
-          break;
-        case ' ':
-        case '\t':
-          // Deal with quotes by overwriting everything but quotes.
-          if (edge_case)
+      case '\\':
+        edge_case[edge_cases++] = '\\';
+        end++;
+        break;
+      case '"':
+        edge_case[edge_cases++] = '"';
+        while (end < bound && *end++ != '"');
+        break;
+      case '\'':
+        edge_case[edge_cases++] = '\'';
+        while (end < bound && *end++ != '\'');
+        break;
+      case ' ':
+      case '\t':
+        // Deal with quotes by overwriting everything but quotes.
+        if (edge_cases)
+        {
+          // Adjust token start to ignore quotes.
+          int open = 0;
+          if (edge_case[0] != '\\')
           {
-            // Adjust token start to ignore quotes.
-            while (*start++ == edge_case);
+            while (*start++ == edge_case[0])
+              open = 1;
             start--;
+          }
 
+          char *left = start, *right = start, c;
+          for (int i = 0; i < edge_cases; i++)
+          {
             // Overwrite the input buffer directly.
-            char *left = start, *right = start, c;
             while (right < end)
-              if ((c = *right++) != edge_case)
+              if ((c = *right++) != edge_case[i])
                 *left++ = c;
+              else if (open)
+              {
+                open = 0;
+                break;
+              }
+              else if (edge_case[i] == '\\')
+              {
+                *left++ = *right++;
+                break;
+              }
+              else
+                open = 1;
+          }
+          while (right < end)
+            *left++ = *right++;
 
-            // Add a null terminator.
-            *(left - 1) = '\0';
-            edge_case = 0;
-          }
-          else
-          {
-            // Replace ' ' by null terminator.
-            *(end - 1) = '\0';
-          }
-          // Store a pointer to the token in `args->v`.
-          *((char **)arena_push(allocator, alignof(char**), sizeof(char**))) = start;
-          count++;
-          while (end < bound) if (!is_whitespace(*end++))
-          {
-            start = --end;
-            break;
-          }
+          // Add a null terminator.
+          *(left - 1) = '\0';
+          edge_cases = 0;
+        }
+        else
+        {
+          // Replace ' ' by null terminator.
+          *(end - 1) = '\0';
+        }
+        // Store a pointer to the token in `args->v`.
+        *((char **)arena_push(allocator, alignof(char**), sizeof(char**))) = start;
+        count++;
+        while (end < bound) if (!is_whitespace(*end++))
+        {
+          start = --end;
+          break;
+        }
         break;
 
       default:
@@ -267,16 +295,36 @@ args* reset_arena_and_parse_args(arena *allocator)
     }
   }
   // Add the last token.
-  if (edge_case)
+  if (edge_cases)
   {
-    while (*start++ == edge_case);
-    start--;
+    int open = 0;
+    if (edge_case[0] != '\\')
+    {
+      while (*start++ == edge_case[0])
+        open = 1;
+      start--;
+    }
 
     char *left = start, *right = start, c;
+    for (int i = 0; i < edge_cases; i++)
+    {
+      while (right < end)
+        if ((c = *right++) != edge_case[i])
+          *left++ = c;
+        else if (open)
+        {
+          open = 0;
+          break;
+        }
+        else if (edge_case[i] == '\\')
+        {
+          *left++ = *right++;
+          break;
+        }
+        else open = 1;
+    }
     while (right < end)
-      if ((c = *right++) != edge_case)
-        *left++ = c;
-
+      *left++ = *right++;
     *left = '\0';
   }
   *((char **)arena_push(allocator, alignof(char**), sizeof(char**))) = start;
