@@ -254,7 +254,9 @@ args* reset_arena_and_parse_args(arena *allocator)
             // Overwrite the input buffer directly.
             while (right < end)
               if ((c = *right++) != edge_case[i])
-                *left++ = c;
+                if (edge_case[i] != '"' || c != '\\' || (*right != '"' && *right != '\\'))
+                  *left++ = c;
+                else *left++ = *right++;
               else if (open)
               {
                 open = 0;
@@ -310,7 +312,9 @@ args* reset_arena_and_parse_args(arena *allocator)
     {
       while (right < end)
         if ((c = *right++) != edge_case[i])
-          *left++ = c;
+          if (edge_case[i] != '"' || c != '\\' || (*right != '"' && *right != '\\'))
+            *left++ = c;
+          else *left++ = *right++;
         else if (open)
         {
           open = 0;
