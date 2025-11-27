@@ -213,51 +213,53 @@ args* reset_arena_and_parse_args(arena *allocator)
     return args;
   }
 
-  char *start = string.data, *end = string.data, *bound = string.data + string.len;
-  size_t count = 0; // Keep count of tokens for `args->c`.
-  int edge_case = 0; // Slow track dealing with quotes.
-  while (end < bound)
-  {
-    switch (*end++) // Advance parser.
+    char *start = string.data, *end = string.data, *bound = string.data + string.len;
+    size_t count = 0; // Keep count of tokens for `args->c`.
+    char edge_case = 0; // Slow track dealing with quotes.
+    while (end < bound)
     {
-      //case '"':
-      case '\'':
-        edge_case = 1;
-        while (end < bound && *end++ != '\'');
-        break;
-      case ' ':
-      case '\t':
-        // Deal with quotes by overwriting everything but quotes.
-        if (edge_case)
-        {
-          edge_case = 0;
-
-          // Adjust token start to ignore quotes.
-          while (*start++ == '\'');
-          start--;
-
-          // Overwrite the input buffer directly.
-          char *left = start, *right = start, c;
-          while (right < end)
-            if ((c = *right++) != '\'')
-              *left++ = c;
-
-          // Add a null terminator.
-          *(left - 1) = '\0';
-        }
-        else
-        {
-          // Replace ' ' by null terminator.
-          *(end - 1) = '\0';
-        }
-        // Store a pointer to the token in `args->v`.
-        *((char **)arena_push(allocator, alignof(char**), sizeof(char**))) = start;
-        count++;
-        while (end < bound) if (!is_whitespace(*end++))
-        {
-          start = --end;
+      switch (*end++) // Advance parser.
+      {
+        case '"':
+          edge_case = '"';
+          while (end < bound && *end++ != '"');
           break;
-        }
+        case '\'':
+          edge_case = '\'';
+          while (end < bound && *end++ != '\'');
+          break;
+        case ' ':
+        case '\t':
+          // Deal with quotes by overwriting everything but quotes.
+          if (edge_case)
+          {
+            // Adjust token start to ignore quotes.
+            while (*start++ == edge_case);
+            start--;
+
+            // Overwrite the input buffer directly.
+            char *left = start, *right = start, c;
+            while (right < end)
+              if ((c = *right++) != edge_case)
+                *left++ = c;
+
+            // Add a null terminator.
+            *(left - 1) = '\0';
+            edge_case = 0;
+          }
+          else
+          {
+            // Replace ' ' by null terminator.
+            *(end - 1) = '\0';
+          }
+          // Store a pointer to the token in `args->v`.
+          *((char **)arena_push(allocator, alignof(char**), sizeof(char**))) = start;
+          count++;
+          while (end < bound) if (!is_whitespace(*end++))
+          {
+            start = --end;
+            break;
+          }
         break;
 
       default:
@@ -267,12 +269,12 @@ args* reset_arena_and_parse_args(arena *allocator)
   // Add the last token.
   if (edge_case)
   {
-    while (*start++ == '\'');
+    while (*start++ == edge_case);
     start--;
 
     char *left = start, *right = start, c;
     while (right < end)
-      if ((c = *right++) != '\'')
+      if ((c = *right++) != edge_case)
         *left++ = c;
 
     *left = '\0';
