@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <stdalign.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -19,12 +20,13 @@
 #define PATH_LIST_SEPARATOR ":"
 #endif
 #define ARENA_DEFAULT_SIZE 8192
+#define ARENA_PUSH_TYPE(type) ((type*)arena_push(allocator, alignof(type), sizeof(type)))
 #define MAX_CWD_SIZE 1024
 #define TOKEN_SHIFT 3
-#define TOKEN_MASK ((1 << TOKEN_SHIFT) - 1)
-#define ARENA_PUSH_TYPE(type) ((type*)arena_push(allocator, alignof(type), sizeof(type)))
+#define TOKEN_TYPE_MASK ((1 << TOKEN_SHIFT) - 1)
+#define EXTRACT_TOKEN_TYPE(token) (token.t & TOKEN_TYPE_MASK)
 #define EXTRACT_TOKEN_PTR(token) ((char*)(token.ptr >> TOKEN_SHIFT))
-#define CHAR_PTR_TO_TOKEN(ptr) (((int64_t) ptr << TOKEN_SHIFT) | Word)
+#define CHAR_PTR_TO_TOKEN(ptr) (((intptr_t) ptr << TOKEN_SHIFT) | Word)
 
 /*=================================================================================================
   ENUMS
@@ -41,23 +43,29 @@ enum Builtins {
 
 enum Token_Type {
   Word,
+  // Redirections:
   RedirectOut,
   RedirectErr,
   AppendOut,
   AppendErr,
+  // Multiple commands:
+  Pipe,
+  Sequential,
+  Background,
   Token_Type_Size,
 };
 
-static_assert(Token_Type_Size - 1 <= TOKEN_MASK, "Token tag does not fit into its mask. Expand shift if possible.");
+static_assert(Token_Type_Size - 1 <= TOKEN_TYPE_MASK, "Token tag does not fit into its mask. Expand shift if possible.");
 
 /*=================================================================================================
   UNIONS
 =================================================================================================*/
 
 typedef union token {
-  int64_t ptr; // Shifted by TOKEN_SHIFT to the left
+  intptr_t ptr; // Shifted by TOKEN_SHIFT to the left
   enum Token_Type t;
 } token;
+static_assert(sizeof(intptr_t) >= sizeof(void*), "`intptr_t` must fit pointers.");
 
 /*=================================================================================================
   STRUCTS
@@ -117,6 +125,7 @@ int main(int argc, char *argv[])
 {
   setbuf(stdout, NULL);
   PATH.data = getenv("PATH");
+  assert(PATH.data && "PATH environment variable not found.");
   PATH.len = strlen(PATH.data);
   arena temp_allocator = {0};
   arena_init(&temp_allocator, ARENA_DEFAULT_SIZE);
@@ -135,32 +144,76 @@ int main(int argc, char *argv[])
     args *a = cmds->v;
 
     // Eval-Print:
-    for (int i = 0; i < cmds->c; i++) {
-      /*for (int i = 0; i < a->c; i++) {
-        printf("arg: %s ", a->v[i]);
-      }
-      printf("redirect %u\n", a->redirection.t);*/
-      // TODO: Implement redirection.
+    for (int i = 0; i < cmds->c; i++)
+    {
       if (!a->c) continue;
+
+      // Redirect.
+      int saved_fd, target_fd;
+      FILE *fp;
+      if (a->redirection.t != Word)
+      {
+        char *modes;
+        switch (EXTRACT_TOKEN_TYPE(a->redirection)) {
+          case RedirectOut:
+            target_fd = STDOUT_FILENO;
+            modes = "w";
+            break;
+          case RedirectErr:
+            target_fd = STDERR_FILENO;
+            modes = "w";
+            break;
+          case AppendOut:
+            target_fd = STDOUT_FILENO;
+            modes = "a";
+            break;
+          case AppendErr:
+            target_fd = STDERR_FILENO;
+            modes = "a";
+            break;
+          case Pipe:
+            printf("Pipe redirection not yet implemented.\n");
+            break;
+          default:
+            assert(0 && "Unreachable: invalid redirection.");
+            break;
+        }
+        saved_fd = dup(target_fd);
+        assert((saved_fd != -1) && "Failed `dup` for redirection.");
+        intptr_t ptr = a->redirection.ptr >> TOKEN_SHIFT;
+        char *dst = (char*)ptr;
+        enum Token_Type t = a->redirection.t & TOKEN_TYPE_MASK;
+        fp = fopen(EXTRACT_TOKEN_PTR(a->redirection), modes);
+        assert(fp && "Failed opening file for redirection.");
+        int fd = fileno(fp);
+        assert((fd != -1) && "Failed `fileno`.");
+        int err = dup2(fd, target_fd);
+        assert((err != -1) && "Failed `dup2` for starting redirection.");
+      }
 
       // Builtins:
       // TODO (long term): hashtable taking `args.v[0]` as key and function to run as value. If there's no match, run the `executable` branch.
       if (strcmp(a->v[0], builtins[CD]) == 0)
       {
         if ((a->c == 1) || (a->c == 2 && (strcmp(a->v[1], "~")) == 0))
-          chdir(getenv("HOME"));
+        {
+          char *home = getenv("HOME");
+          assert(home && "HOME environment variable not found.");
+          chdir(home);
+        }
         else if (a->c == 2 && chdir(a->v[1]))
           printf("cd: %s: No such file or directory\n", a->v[1]);
-        else printf("mysh: cd: too many arguments\n");
+        else if (a->c >= 3)
+        printf("mysh: cd: too many arguments\n");
       }
       else if (strcmp(a->v[0], builtins[PWD]) == 0)
       {
         char *cwd = arena_push(&temp_allocator, alignof(char), MAX_CWD_SIZE);
-        getcwd(cwd, MAX_CWD_SIZE);
+        char *ptr = getcwd(cwd, MAX_CWD_SIZE);
+        assert(ptr && "`getcwd` failed.");
         printf("%s\n", cwd);
       }
       else if (strcmp(a->v[0], builtins[Exit]) == 0)
-      {
         if (a->c == 1)
           exit(0);
         else if (!is_decimal_num(a->v[1]))
@@ -169,7 +222,6 @@ int main(int argc, char *argv[])
           printf("mysh: exit: too many arguments\n");
         else
           exit((unsigned char) atoll(a->v[1]));
-      }
       else if (strcmp(a->v[0], builtins[Echo]) == 0)
       {
         size_t end = a->c - 1;
@@ -185,17 +237,35 @@ int main(int argc, char *argv[])
           type_builtin(a->v[i], &temp_allocator);
       else // executable
       {
-        // TODO: debug this path. Some kind of process spawning is happening wrong. Multiple exits are required after invoking an executable, and they do not execute.
         char *full_path = find_executable(
             (str){ a->v[0], strlen(a->v[0]) },
             &temp_allocator);
-        if (full_path) {
-          // Child process: get args and execute.
-          if (fork() == 0) execv(full_path, a->v);
+        if (full_path)
+        {
+          pid_t pid = fork();
+          assert((pid != -1) && "`fork` failed.");
+          // Child process
+          if (pid == 0)
+          {
+            execv(full_path, a->v);
+            exit(127);
+          }
           // Original process
-          else wait(NULL);
+          else
+          {
+            int wstat;
+            pid_t w = waitpid(pid, &wstat, 0);
+            assert((w != -1) && "`waitpid` failed.");
+          }
         }
         else printf("%s: command not found\n", a->v[0]);
+      }
+      // Restore redirection.
+      if (a->redirection.t != Word)
+      {
+        dup2(saved_fd, target_fd);
+        close(saved_fd);
+        fclose(fp);
       }
       // Advance args pointer to the next args.
       a = (args*)((char*)a + sizeof(args) + (a->c + 1) * sizeof(char*)); // +1 for null termination of `args->v`s.
@@ -254,7 +324,8 @@ char* find_executable(str target, arena *allocator)
         memcpy(full_path + path_len + 1, target.data, target.len + 1);
         if (access(full_path, X_OK) == 0)
         {
-          closedir(dir);
+          int err = closedir(dir);
+          assert((err != -1) && "Error closing directory.");
           return full_path;
         }
       }
@@ -264,19 +335,6 @@ char* find_executable(str target, arena *allocator)
   return NULL;
 }
 
-/*
-  TODO (short term): https://claude.ai/chat/f6236558-c8a3-45a3-aa51-4933f1f28070
-  Build commands out of tokens. Each command has args.c and args.v, which is terminated by a null pointer.
-  A redirection or pipe token splits commands.
-
-  Planned memory layout:
-  [input]
-  [tokens [count (reserve space, fill when known)] [v FAM [token [token_kind_enum] [char *start (null if `>`, `>>`, `|`, etc) pointing into `input`] ] ...] ]
-  [commands [count (reserve space, fill when known)] [v FAM [args [argc] [argv] ]
-  Commands has a count of commands, each command has a count of args. Commands length = for every command, sum 8 (8 bytes argc) + 8 times count (8 bytes per argv char *) + 8 (null pointer).
-  We can optimize `tokens` by storing the token_kind_enum in the LSB of the pointer, and masking the pointer when we need to dereference it.
-
-*/
 tokens* tokenize(arena *allocator)
 {
   char *p = allocator->data; // User input lies at the start of the arena.
@@ -292,8 +350,28 @@ tokens* tokenize(arena *allocator)
     // Finished parsing
     if (!c)
       break;
+    // Multiple commands case
+    if (c == '|')
+    {
+        ARENA_PUSH_TYPE(token)->t = Pipe;
+        p++;
+    }
+    else if (c == '&')
+    {
+      // Sequential
+      if (*(p+1) == '&')
+      {
+        ARENA_PUSH_TYPE(token)->t = Sequential;
+        p += 2;
+      }
+      else
+      {
+        ARENA_PUSH_TYPE(token)->t = Background;
+        p++;
+      }
+    }
     // Redirect stdout case
-    if ((c == '>') || ((c == '1') && (*(p+1) == '>') && p++))
+    else if ((c == '>') || ((c == '1') && (*(p+1) == '>') && p++))
     {
       // Append case
       if (*(p+1) == '>')
@@ -364,9 +442,10 @@ tokens* tokenize(arena *allocator)
         else if (!c || is_whitespace(c))
           break;
         // Edge case:
-        else if (c == '>') // Also applies to pipes
+        else if (c == '>' || c == '|' || c == '&')
         {
-          // Redirection with no whitespace requires parsing the redirection (> or >>) prior to adding the null terminator, which might overwrite the '>'.
+          assert(0 && "Include whitespaces. Parsing not supported.");
+          // These tokens no whitespace require parsing the entire token (> or >>) prior to adding the null terminator, which overwrite the first character.
           // Edge case: what happens when a word is next to `>`? We need to null terminate the word to point into it, but we can't simply overwrite `>` and skip it. Lookahead.
           // TODO: implement this.
           break;
@@ -394,10 +473,22 @@ tokens* tokenize(arena *allocator)
           else if (c == '"')
           {
             while (*read != '"')
-              if (*read == '\\')
+              if (*read == '\\') // ", \, $, `, and newline
               {
-                *write++ = *(read + 1);
-                read += 2;
+                switch (*(read +1))
+                {
+                  case '"':
+                  case '\\':
+                  case '$':
+                  case '`':
+                  case '\n':
+                    *write++ = *(read + 1);
+                    read += 2;
+                    break;
+                  default:
+                    *write++ = *read++;
+                    break;
+                }
               }
               else *write++ = *read++;
             read++;
@@ -419,37 +510,42 @@ commands *parse(tokens* T, arena *allocator)
   // Push a slice to the arena. Fill `commands->v` by pushing args on the arena.
   commands *cmds = ARENA_PUSH_TYPE(commands);
   args *a = ARENA_PUSH_TYPE(args);
-
-  /*for (int i = 0; i < T->c; i++)
-  {
-    if ((T->v[i].t & TOKEN_MASK) == Word)
-      printf("token: %s\n", EXTRACT_TOKEN_PTR(T->v[i]));
-    else printf("token: redir %u\n", T->v[i].t);
-  }*/
+  a->redirection.t = Word;
 
   int i = 0, argc = 0, cmdc = 0, end = T->c;
   while (i < end) {
     token t = T->v[i++];
-    if ((t.t & TOKEN_MASK) == Word)
+    if (EXTRACT_TOKEN_TYPE(t) == Word)
     {
       // Fill `args->v` by pushing words to the arena.
       *ARENA_PUSH_TYPE(char*) = EXTRACT_TOKEN_PTR(t);
       argc++;
     }
-    else
+    // Redirections:
+    else if (t.t <= AppendErr)
     {
-      assert(argc && "Redirected nothing or two redirections in a row.");
+      assert(t.t < Token_Type_Size && "This token should not have an embedded pointer.");
+      assert(i < end && "Syntax error: redirected without a target.");
+      assert(EXTRACT_TOKEN_TYPE(T->v[i]) == Word && "Syntax error: did not redirect to a file.");
+      assert(Word == 0 && "This assumes `Word` to be zero. Otherwise, `T->v[i].ptr` would need to be masked.");
+      a->redirection.ptr = T->v[i++].ptr | t.t;
+    }
+    else // Split command
+    {
+      // FIXME: this does not allow ending a line in & for background tasks.
+      assert(argc && "Syntax error: used | or && without a command on left side.");
       a->c = argc;
-      a->redirection.t = t.t;
+      if (t.t == Pipe) // Do not add redirection for &&
+        a->redirection.t = Pipe; // Pipes don't need a pointer to their destination.
       *ARENA_PUSH_TYPE(char*) = NULL; // Null-terminated `args->v`.
       argc = 0;
       cmdc++;
       a = ARENA_PUSH_TYPE(args);
+      a->redirection.t = Word;
     }
   }
-  assert(argc > 0 && "Ended a line with a redirection to nowhere.");
+  assert(argc > 0 && "Ended a line with a && or | to nowhere.");
   a->c = argc;
-  a->redirection.t = Word;
   *ARENA_PUSH_TYPE(char*) = NULL; // Null-terminated `args->v`.
   cmds->c = cmdc + 1;
 
@@ -483,7 +579,7 @@ void arena_init(arena *arena, size_t size)
   arena->capacity = size;
   if (!arena->data)
   {
-    fprintf(stderr, "Failed initializing arena with %lu bytes.\n", size);
+    fprintf(stderr, "Failed initializing arena with %zu bytes.\n", size);
     exit(1);
   }
 }
