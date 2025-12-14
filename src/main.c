@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <readline/readline.h>
 #include <stdalign.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -120,6 +121,10 @@ char* skip_spaces(char *p);
 
 void arena_init(arena *arena, size_t size);
 void* arena_push(arena *arena, size_t alignment, size_t size);
+void arena_reset(arena *arena);
+
+char **attempted_completion_function(const char *text, int start, int end);
+char *completion_matches_generator(const char *text, int state);
 
 int main(int argc, char *argv[])
 {
@@ -129,16 +134,20 @@ int main(int argc, char *argv[])
   PATH.len = strlen(PATH.data);
   arena temp_allocator = {0};
   arena_init(&temp_allocator, ARENA_DEFAULT_SIZE);
+  rl_attempted_completion_function = attempted_completion_function;
 
   // REPL
-  for (;;)
+  char *input;
+  while ((input = readline("$ ")))
   {
-    printf("$ ");
+    ssize_t line_len = strlen(input);
+    arena_reset(&temp_allocator);
+    char *line_buffer = arena_push(&temp_allocator, alignof(char), line_len + 2); // Double NUL terminator simplifies tokenizing.
+    memcpy(line_buffer, input, line_len + 1);
+    *(line_buffer + line_len + 1 ) = '\0';
+    free(input);
 
     // Read:
-    // This resets the arena by setting `allocator->len`.
-    temp_allocator.len = getline(&temp_allocator.data, &temp_allocator.capacity, stdin);
-    if (temp_allocator.len == -1) exit(0); // EOF
     tokens *tks = tokenize(&temp_allocator);
     commands *cmds = parse(tks, &temp_allocator);
     args *a = cmds->v;
@@ -413,8 +422,8 @@ tokens* tokenize(arena *allocator)
         if (c == '\'')
         {
           should_overwrite = 1;
-          while (*p++ != '\'')
-            assert(*p && "unterminated single quotes");
+          do assert(*p && "unterminated single quotes");
+          while (*p++ != '\'');
         }
         // Ignore _almost_ everything inside double quotes.
         else if (c == '"')
@@ -422,8 +431,8 @@ tokens* tokenize(arena *allocator)
           should_overwrite = 1;
           while (*p != '"')
           {
-            char c = *p++;
             assert(c && "unterminated double quotes");
+            char c = *p++;
             if (c == '\\')
             {
               p++;
@@ -436,6 +445,7 @@ tokens* tokenize(arena *allocator)
         else if (c == '\\')
         {
           should_overwrite = 1;
+          assert(*p && "escaped NUL terminator");
           p++;
         }
         // Base cases: exit when this token is over.
@@ -573,6 +583,21 @@ int is_decimal_num(char *c)
   return 1;
 }
 
+char **attempted_completion_function(const char *text, int start, int end)
+{
+  return start ? NULL : rl_completion_matches(text, completion_matches_generator);
+}
+
+char *completion_matches_generator(const char *text, int state)
+{
+  static int i, len;
+  if (!state) i = 0, len = strlen(text);
+  for (; i < Builtins_Size; i++)
+    if (strncmp(builtins[i], text, len) == 0)
+      return strdup(builtins[i++]);
+  return NULL;
+}
+
 void arena_init(arena *arena, size_t size)
 {
   arena->data = malloc(size);
@@ -595,3 +620,5 @@ void* arena_push(arena *arena, size_t alignment, size_t size)
   arena->len = aligned_length + size;
   return arena->data + aligned_length;
 }
+
+void arena_reset(arena *arena) { arena->len = 0; }
