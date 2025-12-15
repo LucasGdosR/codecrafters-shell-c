@@ -28,6 +28,13 @@
 #define EXTRACT_TOKEN_TYPE(token) (token.t & TOKEN_TYPE_MASK)
 #define EXTRACT_TOKEN_PTR(token) ((char*)(token.ptr >> TOKEN_SHIFT))
 #define CHAR_PTR_TO_TOKEN(ptr) (((intptr_t) ptr << TOKEN_SHIFT) | Word)
+#define EXTENDED_ASCII 256
+#define TRIE_ARRAY_SIZE EXTENDED_ASCII
+#define ROUND_UP_INT_DVISION(numer, denom) ((numer + denom - 1) / denom)
+#define ARRAY_COUNT(arr) (sizeof(arr) / sizeof(arr[0]))
+#define MIN(a, b) (a < b ? a : b)
+#define LSB64(n) __builtin_ctzll(n)
+#define MSB64(n) (63 - __builtin_clzll(n))
 
 /*=================================================================================================
   ENUMS
@@ -62,6 +69,7 @@ static_assert(Token_Type_Size - 1 <= TOKEN_TYPE_MASK, "Token tag does not fit in
   UNIONS
 =================================================================================================*/
 
+/* `token` stores both a pointer and a tag at the SAME TIME. */
 typedef union token {
   intptr_t ptr; // Shifted by TOKEN_SHIFT to the left
   enum Token_Type t;
@@ -72,68 +80,120 @@ static_assert(sizeof(intptr_t) >= sizeof(void*), "`intptr_t` must fit pointers."
   STRUCTS
 =================================================================================================*/
 
+/* String with length. */
 typedef struct str {
   char *data;
   size_t len;
 } str;
 
+/* Bump allocator. */
 typedef struct arena {
-  char *data;
   size_t len;
   size_t capacity;
+  char *data;
 } arena;
 
+/* Growing bump allocator. */
+typedef struct arena_exponential {
+  size_t len;
+  size_t first_block_capacity;
+  char *room[6];
+} arena_exponential;
+
+/* FAM struct for tokenizing result. */
 typedef struct tokens {
   size_t c;
   token v[];
 } tokens;
 
+/* FAM struct for args. */
 typedef struct args {
   size_t c;
+  // Includes both pointer and tag.
   token redirection;
   char *v[];
 } args;
 
+/* FAM struct for parsing result. */
 typedef struct commands {
   size_t c;
+  // Nested FAM struct.
   args v[];
 } commands;
 
-/*=================================================================================================
-  GLOBALS
-=================================================================================================*/
-
-str PATH;
-char *builtins[] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
+/* Data structure for autocompletion. */
+typedef struct trie {
+  struct trie *children[TRIE_ARRAY_SIZE];
+  // Compact representation to quickly search through existent children.
+  uint64_t exist_bitset[ROUND_UP_INT_DVISION(TRIE_ARRAY_SIZE, 64)];
+  // String for `type` built-in. Serves as a flag showing the word exists.
+  char *full_path;
+} trie;
 
 /*=================================================================================================
   FUNCTIONS
 =================================================================================================*/
 
-char* find_executable(str target, arena *allocator);
+char* find_executable(char *target);
 tokens* tokenize(arena *allocator);
 commands *parse(tokens* T, arena *allocator);
-void type_builtin(char *arg, arena *allocator);
+
+void builtin_cd(args *a, arena *allocator);
+void builtin_pwd(args *a, arena *allocator);
+void builtin_echo(args *a, arena *allocator);
+void builtin_type(args *a, arena *allocator);
+void builtin_exit(args *a, arena *allocator);
 
 int is_whitespace(char c);
 int is_decimal_num(char *c);
 char* skip_spaces(char *p);
 
 void arena_init(arena *arena, size_t size);
+void arena_destroy(arena *arena);
 void* arena_push(arena *arena, size_t alignment, size_t size);
+void* arena_exponential_push(arena_exponential *a, size_t alignment, size_t size);
 void arena_reset(arena *arena);
 
-char **attempted_completion_function(const char *text, int start, int end);
-char *completion_matches_generator(const char *text, int state);
+void trie_init(arena_exponential *trie_arena, arena_exponential *strings_arena);
+trie* trie_alloc(arena_exponential *allocator);
+void trie_insert(arena_exponential *allocator, trie *t, char *entry, char *full_path);
+void trie_push_walk(trie *t, str curr, arena *allocator);
+trie* trie_get(trie *t, const char *target);
+
+char** attempted_completion_function(const char *text, int start, int end);
+char* completion_matches_generator(const char *text, int state);
+
+/*=================================================================================================
+  GLOBALS
+=================================================================================================*/
+
+/* Mappings from enum to string / functions. */
+char *builtins[Builtins_Size] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
+void (*builtin_functions[Builtins_Size])(args *, arena *) = {
+  [CD]=builtin_cd, [PWD]=builtin_pwd, [Echo]=builtin_echo, [Type]=builtin_type, [Exit]=builtin_exit};
+/* Global trie to interface with GNU Readline. */
+trie *T;
+
+/*=================================================================================================
+  IMPLEMENTATIONS
+=================================================================================================*/
 
 int main(int argc, char *argv[])
 {
   setbuf(stdout, NULL);
-  PATH.data = getenv("PATH");
-  assert(PATH.data && "PATH environment variable not found.");
-  PATH.len = strlen(PATH.data);
-  arena temp_allocator = {0};
-  arena_init(&temp_allocator, ARENA_DEFAULT_SIZE);
+
+  // Keep arenas separate so the trie has better memory page locality.
+  arena_exponential trie_arena = {0}; // For the trie.
+  arena_init((arena *)&trie_arena, ARENA_DEFAULT_SIZE);
+  arena_exponential permanent_strings_arena = {0}; // For the trie.
+  arena_init((arena *)&permanent_strings_arena, ARENA_DEFAULT_SIZE);
+
+  arena repl_arena = {0};
+  arena_init(&repl_arena, ARENA_DEFAULT_SIZE);
+
+  trie_init(&trie_arena, &permanent_strings_arena);
+
+  // GNU Readline interface.
   rl_attempted_completion_function = attempted_completion_function;
 
   // REPL
@@ -141,15 +201,16 @@ int main(int argc, char *argv[])
   while ((input = readline("$ ")))
   {
     ssize_t line_len = strlen(input);
-    arena_reset(&temp_allocator);
-    char *line_buffer = arena_push(&temp_allocator, alignof(char), line_len + 2); // Double NUL terminator simplifies tokenizing.
+    arena_reset(&repl_arena);
+    // TODO: reuse `readline`'s buffer instead of copying it to arena.
+    char *line_buffer = arena_push(&repl_arena, alignof(char), line_len + 2); // Double NUL terminator simplifies tokenizing.
     memcpy(line_buffer, input, line_len + 1);
     *(line_buffer + line_len + 1 ) = '\0';
     free(input);
 
     // Read:
-    tokens *tks = tokenize(&temp_allocator);
-    commands *cmds = parse(tks, &temp_allocator);
+    tokens *tks = tokenize(&repl_arena);
+    commands *cmds = parse(tks, &repl_arena);
     args *a = cmds->v;
 
     // Eval-Print:
@@ -201,54 +262,16 @@ int main(int argc, char *argv[])
       }
 
       // Builtins:
-      // TODO (long term): hashtable taking `args.v[0]` as key and function to run as value. If there's no match, run the `executable` branch.
-      if (strcmp(a->v[0], builtins[CD]) == 0)
+      int is_builtin = 0;
+      for (int i = 0; i < Builtins_Size; i++) if (strcmp(a->v[0], builtins[i]) == 0)
       {
-        if ((a->c == 1) || (a->c == 2 && (strcmp(a->v[1], "~")) == 0))
-        {
-          char *home = getenv("HOME");
-          assert(home && "HOME environment variable not found.");
-          chdir(home);
-        }
-        else if (a->c == 2 && chdir(a->v[1]))
-          printf("cd: %s: No such file or directory\n", a->v[1]);
-        else if (a->c >= 3)
-        printf("mysh: cd: too many arguments\n");
+        builtin_functions[i](a, &repl_arena);
+        is_builtin = 1;
+        break;
       }
-      else if (strcmp(a->v[0], builtins[PWD]) == 0)
+      if (!is_builtin) // executable
       {
-        char *cwd = arena_push(&temp_allocator, alignof(char), MAX_CWD_SIZE);
-        char *ptr = getcwd(cwd, MAX_CWD_SIZE);
-        assert(ptr && "`getcwd` failed.");
-        printf("%s\n", cwd);
-      }
-      else if (strcmp(a->v[0], builtins[Exit]) == 0)
-        if (a->c == 1)
-          exit(0);
-        else if (!is_decimal_num(a->v[1]))
-          exit(2);
-        else if (a->c > 2)
-          printf("mysh: exit: too many arguments\n");
-        else
-          exit((unsigned char) atoll(a->v[1]));
-      else if (strcmp(a->v[0], builtins[Echo]) == 0)
-      {
-        size_t end = a->c - 1;
-        if (end)
-        {
-          for (size_t i = 1; i < end; ++i)
-            printf("%s ", a->v[i]);
-          printf("%s\n", a->v[end]);
-        }
-      }
-      else if (strcmp(a->v[0], builtins[Type]) == 0)
-        for (int i = 1; i < a->c; i++)
-          type_builtin(a->v[i], &temp_allocator);
-      else // executable
-      {
-        char *full_path = find_executable(
-            (str){ a->v[0], strlen(a->v[0]) },
-            &temp_allocator);
+        char *full_path = find_executable(a->v[0]);
         if (full_path)
         {
           pid_t pid = fork();
@@ -257,7 +280,7 @@ int main(int argc, char *argv[])
           if (pid == 0)
           {
             execv(full_path, a->v);
-            exit(127);
+            exit(EXIT_FAILURE);
           }
           // Original process
           else
@@ -284,64 +307,76 @@ int main(int argc, char *argv[])
   return 0;
 }
 
-void type_builtin(char *arg, arena *allocator)
+void builtin_cd(args *a, arena *allocator)
 {
-  size_t len = strlen(arg);
-  // Builtin case:
-  // For now, all builtins have length <= 4.
-  // TODO (long term): once we have a hashtable with functions, check in that instead of iterating over an array.
-  if (len <= 4)
+  if ((a->c == 1) || (a->c == 2 && (strcmp(a->v[1], "~")) == 0))
   {
-    for (int i = 0; i < Builtins_Size; ++i)
-    {
-      if (strcmp(arg, builtins[i]) == 0)
-      {
-        printf("%s is a shell builtin\n", arg);
-        return;
-      }
-    }
+    char *home = getenv("HOME");
+    assert(home && "HOME environment variable not found.");
+    chdir(home);
   }
-
-  // Executable case:
-  char *full_path = find_executable((str){ arg, len }, allocator);
-  if (full_path)
-    printf("%s is %s\n", arg, full_path);
-  // Default case:
-  else printf("%s: not found\n", arg);
+  else if (a->c == 2 && chdir(a->v[1]))
+    printf("cd: %s: No such file or directory\n", a->v[1]);
+  else if (a->c >= 3)
+  printf("mysh: cd: too many arguments\n");
 }
 
-// TODO (long term): this needlessly iterates over directory entries. Just try `access` concatenating `dir_str` and `target`.
-char* find_executable(str target, arena *allocator)
+void builtin_pwd(args *a, arena *allocator)
 {
-  // PATH is immutable, so make a mutable copy.
-  char *path = arena_push(allocator, alignof(char), PATH.len+1);
-  memcpy(path, PATH.data, PATH.len+1);
+  char *cwd = arena_push(allocator, alignof(char), MAX_CWD_SIZE);
+  char *ptr = getcwd(cwd, MAX_CWD_SIZE);
+  assert(ptr && "`getcwd` failed.");
+  printf("%s\n", cwd);
+}
 
-  char *dir_str;
-  while ((dir_str = strsep(&path, PATH_LIST_SEPARATOR)))
+void builtin_echo(args *a, arena *allocator)
+{
+  size_t end = a->c - 1;
+  if (end)
   {
-    DIR *dir = opendir(dir_str);
-    struct dirent *entry;
-    if (dir) while ((entry = readdir(dir)))
-    {
-      if (entry->d_type == DT_REG && strcmp(entry->d_name, target.data) == 0)
-      {
-        unsigned long path_len = strlen(dir_str);
-        char *full_path = arena_push(allocator, alignof(char), target.len + path_len + 2);
-        memcpy(full_path, dir_str, path_len);
-        full_path[path_len] = '/';
-        memcpy(full_path + path_len + 1, target.data, target.len + 1);
-        if (access(full_path, X_OK) == 0)
-        {
-          int err = closedir(dir);
-          assert((err != -1) && "Error closing directory.");
-          return full_path;
-        }
-      }
-    }
-    closedir(dir);
+    for (size_t i = 1; i < end; ++i)
+      printf("%s ", a->v[i]);
+    printf("%s\n", a->v[end]);
   }
-  return NULL;
+}
+
+void builtin_type(args *a, arena *allocator)
+{
+  for (int i = 1; i < a->c; i++)
+  {
+    char *arg = a->v[i];
+    char *full_path = find_executable(arg);
+    if (full_path)
+      printf("%s is %s\n", arg, full_path);
+    // Default case:
+    else printf("%s: not found\n", arg);
+  }
+}
+
+void builtin_exit(args *a, arena *allocator)
+{
+  if (a->c == 1)
+    exit(0);
+  else if (!is_decimal_num(a->v[1]))
+    exit(2);
+  else if (a->c > 2)
+    printf("mysh: exit: too many arguments\n");
+  else
+    exit((unsigned char) atoll(a->v[1]));
+}
+
+char* find_executable(char *target)
+{
+  trie *t = T;
+  unsigned char c;
+  while ((c = *target++))
+  {
+    int array_idx = c >> 6, bitset_idx = c & 63;
+    if (!(t->exist_bitset[array_idx] & ((uint64_t)1 << bitset_idx)))
+      return NULL;
+    t = t->children[c];
+  }
+  return t->full_path;
 }
 
 tokens* tokenize(arena *allocator)
@@ -583,6 +618,118 @@ int is_decimal_num(char *c)
   return 1;
 }
 
+void trie_init(arena_exponential *trie_arena, arena_exponential *strings_arena)
+{
+  T = trie_alloc(trie_arena);
+
+  char *builtin_path = arena_exponential_push(strings_arena, alignof(char), 16);
+  char *default_msg = "a shell builtin";
+  memcpy(builtin_path, default_msg, 16);
+  assert((strlen(default_msg) + 1) == 16);
+  for (int i = 0; i < Builtins_Size; i++)
+    trie_insert(trie_arena, T, builtins[i], builtin_path);
+
+  str PATH;
+  PATH.data = getenv("PATH");
+  assert(PATH.data && "PATH environment variable not found.");
+  PATH.len = strlen(PATH.data);
+
+  // PATH is immutable, so make a mutable copy.
+  arena scratch_arena = {0};
+  arena_init(&scratch_arena, PATH.len+1);
+  char *path = arena_push(&scratch_arena, alignof(char), PATH.len+1);
+  memcpy(path, PATH.data, PATH.len+1);
+
+  char *dir_str;
+  while ((dir_str = strsep(&path, PATH_LIST_SEPARATOR)))
+  {
+    DIR *dir = opendir(dir_str);
+    struct dirent *entry;
+    if (dir)
+    {
+      while ((entry = readdir(dir)))
+      {
+        if (entry->d_type == DT_REG)
+        {
+          unsigned long path_len = strlen(dir_str);
+          unsigned long executable_len = strlen(entry->d_name);
+          char *full_path = arena_exponential_push(strings_arena, alignof(char), executable_len + path_len + 2);
+          memcpy(full_path, dir_str, path_len);
+          full_path[path_len] = '/';
+          memcpy(full_path + path_len + 1, entry->d_name, executable_len + 1);
+          if (access(full_path, X_OK) == 0)
+            trie_insert(trie_arena, T, entry->d_name, full_path);
+        }
+      }
+      closedir(dir);
+    }
+  }
+
+  arena_destroy(&scratch_arena);
+}
+
+trie* trie_alloc(arena_exponential *allocator)
+{
+  trie *t = arena_exponential_push(allocator, alignof(trie), sizeof(trie));
+  memset(t->exist_bitset, 0, sizeof(t->exist_bitset));
+  t->full_path = NULL;
+  return t;
+}
+
+void trie_insert(arena_exponential *allocator, trie *t, char *entry, char *full_path)
+{
+  unsigned char c;
+  while ((c = *entry++))
+  {
+    int array_idx = c >> 6, bitset_idx = c & 63;
+    if (!(t->exist_bitset[array_idx] & ((uint64_t)1 << bitset_idx)))
+    {
+      t->exist_bitset[array_idx] |= (uint64_t)1 << bitset_idx;
+      t->children[c] = trie_alloc(allocator);
+    }
+    t = t->children[c];
+  }
+  if (!t->full_path)
+    t->full_path = full_path;
+}
+
+void trie_push_walk(trie *t, str curr, arena *allocator)
+{
+  assert(t && "we always check t->exist_bitset before recursing, so `t` cannot be null");
+  assert(curr.len < 256 && "buffer overflowed");
+  if (t->full_path)
+  {
+    curr.data[curr.len] = '\0';
+    *ARENA_PUSH_TYPE(char*) = strdup(curr.data);
+  }
+  for (int i = 0; i < ARRAY_COUNT(t->exist_bitset); i++)
+  {
+    uint64_t bitset = t->exist_bitset[i];
+    while (bitset)
+    {
+      int LSB = LSB64(bitset);
+      unsigned char ascii_char = 64 * i + LSB;
+      curr.data[curr.len++] = ascii_char;
+      trie_push_walk(t->children[ascii_char], curr, allocator);
+      curr.len--;
+      bitset &= bitset - 1;
+    }
+  }
+}
+
+trie* trie_get(trie *t, const char *target)
+{
+  unsigned char c = *target;
+  if (c)
+  {
+    int array_idx = c >> 6, bitset_idx = c & 63;
+    return ((t->exist_bitset[array_idx] & ((uint64_t)1 << bitset_idx)))
+      ? trie_get(t->children[c], target + 1)
+      : NULL;
+  }
+  else return t;
+}
+
 char **attempted_completion_function(const char *text, int start, int end)
 {
   return start ? NULL : rl_completion_matches(text, completion_matches_generator);
@@ -590,12 +737,35 @@ char **attempted_completion_function(const char *text, int start, int end)
 
 char *completion_matches_generator(const char *text, int state)
 {
-  static int i, len;
-  if (!state) i = 0, len = strlen(text);
-  for (; i < Builtins_Size; i++)
-    if (strncmp(builtins[i], text, len) == 0)
-      return strdup(builtins[i++]);
-  return NULL;
+  /****************************************************************************
+   * Store strings with malloc. Store pointers to them in the scratch arena.
+   * Get the count of strings by the length of the scratch arena.
+   * Destroy the scratch arena after returning the last pointer.
+   ****************************************************************************/
+  static arena scratch_ptr_arena = {0};
+  static size_t idx = 0;
+  if (!state)
+  {
+    trie *t = trie_get(T, text);
+    // No match.
+    if (!t)
+      return NULL;
+    else
+    {
+      arena_init(&scratch_ptr_arena, ARENA_DEFAULT_SIZE);
+      char buffer[256];
+      str s = { buffer, strlen(text) };
+      memcpy(s.data, text, MIN(s.len, 256));
+      trie_push_walk(t, s, &scratch_ptr_arena);
+    }
+  }
+  if (idx * sizeof(char*) < scratch_ptr_arena.len)
+    return ((char **)scratch_ptr_arena.data)[idx++];
+  else
+  {
+    arena_destroy(&scratch_ptr_arena);
+    return NULL;
+  }
 }
 
 void arena_init(arena *arena, size_t size)
@@ -609,6 +779,8 @@ void arena_init(arena *arena, size_t size)
   }
 }
 
+void arena_destroy(arena *arena) { free(arena->data); }
+
 void* arena_push(arena *arena, size_t alignment, size_t size)
 {
   size_t bit_mask = alignment - 1;
@@ -619,6 +791,40 @@ void* arena_push(arena *arena, size_t alignment, size_t size)
 
   arena->len = aligned_length + size;
   return arena->data + aligned_length;
+}
+
+void* arena_exponential_push(arena_exponential *arena, size_t alignment, size_t size)
+{
+  // Get the MSB of `arena->len / arena->first_block_capacity`.
+  int block_idx = MSB64(arena->len / arena->first_block_capacity);
+  /****************************
+   * len / capacity cases:
+   * 0 => first block
+   * 1 => second block => 2x capacity
+   * 2-3 => third block => 4x capacity
+   * 4-7 => fourth block => 8x capacity
+   * 8-15 => fifth block => 16x capacity
+   * 16-31 => sixth block => 32x capacity
+   ****************************/
+  int capacity = arena->first_block_capacity << block_idx;
+
+  size_t bit_mask = alignment - 1;
+  assert((alignment != 0) && ((alignment & bit_mask) == 0) && "alignment must be a power of two");
+
+  size_t aligned_length = (arena->len + bit_mask) & ~bit_mask;
+  // No room left in this block. Skip to the next
+  while (aligned_length + size > capacity)
+  {
+    assert(block_idx <= 4 && "arena_exponential overflowed");
+    block_idx++;
+    aligned_length = capacity;
+    arena->room[block_idx] = malloc(capacity);
+    capacity <<= 1;
+  }
+
+  arena->len = aligned_length + size;
+
+  return arena->room[block_idx] + aligned_length - (block_idx ? capacity >> 1 : 0);
 }
 
 void arena_reset(arena *arena) { arena->len = 0; }

@@ -1,34 +1,29 @@
-[![progress-banner](https://backend.codecrafters.io/progress/shell/e1c1cd9a-8560-47d9-ae94-4514d42a04bc)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# LUSH: Lucas' Shell
 
-This is a starting point for C solutions to the
-["Build Your Own Shell" Challenge](https://app.codecrafters.io/courses/shell/overview).
+LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.codecrafters.io/courses/shell/overview).
 
-In this challenge, you'll build your own POSIX compliant shell that's capable of
-interpreting shell commands, running external programs and builtin commands like
-cd, pwd, echo and more. Along the way, you'll learn about shell command parsing,
-REPLs, builtin commands, and more.
+> In this challenge, you'll build your own POSIX compliant shell that's capable of interpreting shell commands, running external programs and builtin commands like cd, pwd, echo and more. Along the way, you'll learn about shell command parsing, REPLs, builtin commands, and more.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## Functionalities
 
-# Passing the first stage
+- Built-ins: `echo`, `exit`, `type`, `pwd`, `cd`;
+- Runs executables found in PATH;
+- Redirects stdout / stderr to files, supporting both truncate and append modes;
+- File, built-ins and executables autocomplete w/ TAB using GNU Readline;
+- Sequential commands with && in a single line;
 
-The entry point for your `shell` implementation is in `src/main.c`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+### TODO
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
-```
+- Pipes;
+- Background executions;
+- History built-in;
 
-Time to move on to the next stage!
+## Highlights
 
-# Stage 2 & beyond
+- Destructive parsing, reusing the input buffer and overwriting token boundaries with null terminators (TODO: get rid of `memcopy` from Readline);
+- Tokens stored in 8 bytes, storing both a pointer shifted to the left and a tag in the least significant bits;
+- Flexible Array Members (FAM) that store pointers directly into the input buffer that was modified;
+- Arena memory management, including exponential growing arena with bit hacks;
+- Trie implementation for blazingly fast autocomplete;
 
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `cmake` installed locally
-1. Run `./your_program.sh` to run your program, which is implemented in
-   `src/main.c`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+**Note**: If you're viewing this repo on GitHub, head over to [codecrafters.io](https://codecrafters.io) to try the challenge.
