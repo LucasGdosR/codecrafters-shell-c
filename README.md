@@ -24,6 +24,7 @@ LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.
 - Tokens stored in 8 bytes, storing both a pointer shifted to the left and a tag in the least significant bits;
 - Flexible Array Members (FAM) that store pointers directly into the input buffer that was modified;
 - Arena memory management, including exponential growing arena with bit hacks;
-- Trie implementation for blazingly fast autocomplete;
+- Sorted string list implementation for fast autocomplete with low memory overhead (history has a trie implementation with higher memory overhead);
+- Does initialization in a background thread to let the user type right away;
 
-**Note**: If you're viewing this repo on GitHub, head over to [codecrafters.io](https://codecrafters.io) to try the challenge.
+**Note**: Head over to [codecrafters.io](https://codecrafters.io) to try the challenge.

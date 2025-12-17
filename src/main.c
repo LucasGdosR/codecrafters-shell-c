@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <readline/readline.h>
 #include <stdalign.h>
 #include <stddef.h>
@@ -8,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -21,20 +23,25 @@
 #define PATH_LIST_SEPARATOR ":"
 #endif
 #define ARENA_DEFAULT_SIZE 8192
-#define ARENA_PUSH_TYPE(type) ((type*)arena_push(allocator, alignof(type), sizeof(type)))
+#define ARENA_PUSH_TYPE(arena, type) ((type*)arena_push(arena, alignof(type), sizeof(type)))
+#define ALLOCATOR_PUSH_TYPE(type) ARENA_PUSH_TYPE(allocator, type)
 #define MAX_CWD_SIZE 1024
 #define TOKEN_SHIFT 3
 #define TOKEN_TYPE_MASK ((1 << TOKEN_SHIFT) - 1)
-#define EXTRACT_TOKEN_TYPE(token) (token.t & TOKEN_TYPE_MASK)
-#define EXTRACT_TOKEN_PTR(token) ((char*)(token.ptr >> TOKEN_SHIFT))
-#define CHAR_PTR_TO_TOKEN(ptr) (((intptr_t) ptr << TOKEN_SHIFT) | Word)
+#define EXTRACT_TOKEN_TYPE(token) ((token).t & TOKEN_TYPE_MASK)
+#define EXTRACT_TOKEN_PTR(token) ((char*)((token).ptr >> TOKEN_SHIFT))
+#define CHAR_PTR_TO_TOKEN(ptr) (((intptr_t) (ptr) << TOKEN_SHIFT) | Word)
 #define EXTENDED_ASCII 256
 #define TRIE_ARRAY_SIZE EXTENDED_ASCII
-#define ROUND_UP_INT_DVISION(numer, denom) ((numer + denom - 1) / denom)
-#define ARRAY_COUNT(arr) (sizeof(arr) / sizeof(arr[0]))
-#define MIN(a, b) (a < b ? a : b)
+#define ROUND_UP_INT_DVISION(numer, denom) (((numer) + (denom) - 1) / (denom))
+#define ARRAY_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define LSB64(n) __builtin_ctzll(n)
 #define MSB64(n) (63 - __builtin_clzll(n))
+#define KB (1 << 10)
+#define MB (KB << 10)
+#define GB (MB << 10)
+#define ALIGN_UP(n, alignment) (((n) + (alignment) - 1) & ~((alignment) - 1))
 
 /*=================================================================================================
   ENUMS
@@ -121,58 +128,76 @@ typedef struct commands {
   args v[];
 } commands;
 
-/* Data structure for autocompletion. */
-typedef struct trie {
-  struct trie *children[TRIE_ARRAY_SIZE];
-  // Compact representation to quickly search through existent children.
-  uint64_t exist_bitset[ROUND_UP_INT_DVISION(TRIE_ARRAY_SIZE, 64)];
-  // String for `type` built-in. Serves as a flag showing the word exists.
-  char *full_path;
-} trie;
+/* Cached sorted strings for autocomplete and `type` built-in.
+ * Underlying buffer is created by:
+ * `malloc(
+ *    str_len_sum +               // all executables and full paths
+ *    2 * count +                 // null terminator for strings
+ *    sizeof(int32_t) * 2 * count // offsets for strings
+ *  );`
+ * Destroying this is as simple as `free(strings.strings)`
+ * and setting fields to 0.
+ */
+typedef struct permanent_strings {
+  // Points to the first executable / built-in string in lexicographic order,
+  // followed by all executable strings,
+  // followed by all full-paths (same order).
+  char *strings;
+  // `strings + offsets[n]` finds the n-th executable string.
+  // `strings + offsets[count + n]` finds the n-th full-path.
+  // `offsets[2 * count]` is out of bounds.
+  int32_t *offsets;
+  uint32_t count;
+} permanent_strings;
+
+typedef struct temp_entry {
+  char *name;
+  char *full_path; // NULL for built-in
+} temp_entry;
 
 /*=================================================================================================
   FUNCTIONS
 =================================================================================================*/
 
-char* find_executable(char *target);
-tokens* tokenize(arena *allocator);
-commands *parse(tokens* T, arena *allocator);
+static char* find_executable(char *target);
+static tokens* tokenize(arena *allocator);
+static commands *parse(tokens* T, arena *allocator);
 
-void builtin_cd(args *a, arena *allocator);
-void builtin_pwd(args *a, arena *allocator);
-void builtin_echo(args *a, arena *allocator);
-void builtin_type(args *a, arena *allocator);
-void builtin_exit(args *a, arena *allocator);
+static void builtin_cd(args *a, arena *allocator);
+static void builtin_pwd(args *a, arena *allocator);
+static void builtin_echo(args *a, arena *allocator);
+static void builtin_type(args *a, arena *allocator);
+static void builtin_exit(args *a, arena *allocator);
 
-int is_whitespace(char c);
-int is_decimal_num(char *c);
-char* skip_spaces(char *p);
+static int is_whitespace(char c);
+static int is_decimal_num(char *c);
+static char* skip_spaces(char *p);
 
-void arena_init(arena *arena, size_t size);
-void arena_destroy(arena *arena);
-void* arena_push(arena *arena, size_t alignment, size_t size);
-void* arena_exponential_push(arena_exponential *a, size_t alignment, size_t size);
-void arena_reset(arena *arena);
+static void arena_init(arena *arena, size_t size);
+static void arena_destroy(arena *arena);
+static void* arena_push(arena *arena, size_t alignment, size_t size);
+static void* arena_exponential_push(arena_exponential *a, size_t alignment, size_t size);
+static void arena_reset(arena *arena);
 
-void trie_init(arena_exponential *trie_arena, arena_exponential *strings_arena);
-trie* trie_alloc(arena_exponential *allocator);
-void trie_insert(arena_exponential *allocator, trie *t, char *entry, char *full_path);
-void trie_push_walk(trie *t, str curr, arena *allocator);
-trie* trie_get(trie *t, const char *target);
+static void build_autocomplete_strings();
+static int temp_entry_cmp(const void *a, const void *b);
+static int32_t strings_binary_search(const char *target);
+static void* init_once(void*);
 
-char** attempted_completion_function(const char *text, int start, int end);
-char* completion_matches_generator(const char *text, int state);
+static char** attempted_completion_function(const char *text, int start, int end);
+static char* completion_matches_generator(const char *text, int state);
 
 /*=================================================================================================
   GLOBALS
 =================================================================================================*/
 
 /* Mappings from enum to string / functions. */
-char *builtins[Builtins_Size] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
-void (*builtin_functions[Builtins_Size])(args *, arena *) = {
+static char *builtins[Builtins_Size] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
+static void (*builtin_functions[Builtins_Size])(args *, arena *) = {
   [CD]=builtin_cd, [PWD]=builtin_pwd, [Echo]=builtin_echo, [Type]=builtin_type, [Exit]=builtin_exit};
-/* Global trie to interface with GNU Readline. */
-trie *T;
+/* Global sorted string list to interface with GNU Readline. */
+permanent_strings strings = {0};
+static pthread_once_t strings_once = PTHREAD_ONCE_INIT;
 
 /*=================================================================================================
   IMPLEMENTATIONS
@@ -180,18 +205,17 @@ trie *T;
 
 int main(int argc, char *argv[])
 {
+  pthread_t tid;
+  if (pthread_create(&tid, NULL, init_once, NULL) != 0)
+  {
+    perror("Error spawning thread. Building string list in main thread instead.\n");
+    pthread_once(&strings_once, build_autocomplete_strings);
+  }
+  pthread_detach(tid);
   setbuf(stdout, NULL);
 
-  // Keep arenas separate so the trie has better memory page locality.
-  arena_exponential trie_arena = {0}; // For the trie.
-  arena_init((arena *)&trie_arena, ARENA_DEFAULT_SIZE);
-  arena_exponential permanent_strings_arena = {0}; // For the trie.
-  arena_init((arena *)&permanent_strings_arena, ARENA_DEFAULT_SIZE);
-
-  arena repl_arena = {0};
+  arena repl_arena;
   arena_init(&repl_arena, ARENA_DEFAULT_SIZE);
-
-  trie_init(&trie_arena, &permanent_strings_arena);
 
   // GNU Readline interface.
   rl_attempted_completion_function = attempted_completion_function;
@@ -307,13 +331,14 @@ int main(int argc, char *argv[])
   return 0;
 }
 
-void builtin_cd(args *a, arena *allocator)
+static void builtin_cd(args *a, arena *allocator)
 {
   if ((a->c == 1) || (a->c == 2 && (strcmp(a->v[1], "~")) == 0))
   {
     char *home = getenv("HOME");
     assert(home && "HOME environment variable not found.");
-    chdir(home);
+    if (chdir(home))
+      printf("cd: %s: No such file or directory\n", a->v[1]);
   }
   else if (a->c == 2 && chdir(a->v[1]))
     printf("cd: %s: No such file or directory\n", a->v[1]);
@@ -321,7 +346,7 @@ void builtin_cd(args *a, arena *allocator)
   printf("mysh: cd: too many arguments\n");
 }
 
-void builtin_pwd(args *a, arena *allocator)
+static void builtin_pwd(args *a, arena *allocator)
 {
   char *cwd = arena_push(allocator, alignof(char), MAX_CWD_SIZE);
   char *ptr = getcwd(cwd, MAX_CWD_SIZE);
@@ -329,7 +354,7 @@ void builtin_pwd(args *a, arena *allocator)
   printf("%s\n", cwd);
 }
 
-void builtin_echo(args *a, arena *allocator)
+static void builtin_echo(args *a, arena *allocator)
 {
   size_t end = a->c - 1;
   if (end)
@@ -340,7 +365,7 @@ void builtin_echo(args *a, arena *allocator)
   }
 }
 
-void builtin_type(args *a, arena *allocator)
+static void builtin_type(args *a, arena *allocator)
 {
   for (int i = 1; i < a->c; i++)
   {
@@ -353,7 +378,7 @@ void builtin_type(args *a, arena *allocator)
   }
 }
 
-void builtin_exit(args *a, arena *allocator)
+static void builtin_exit(args *a, arena *allocator)
 {
   if (a->c == 1)
     exit(0);
@@ -365,26 +390,23 @@ void builtin_exit(args *a, arena *allocator)
     exit((unsigned char) atoll(a->v[1]));
 }
 
-char* find_executable(char *target)
+static char* find_executable(char *target)
 {
-  trie *t = T;
-  unsigned char c;
-  while ((c = *target++))
-  {
-    int array_idx = c >> 6, bitset_idx = c & 63;
-    if (!(t->exist_bitset[array_idx] & ((uint64_t)1 << bitset_idx)))
-      return NULL;
-    t = t->children[c];
-  }
-  return t->full_path;
+  int32_t offset = strings_binary_search(target);
+  if (offset == -1)
+    return NULL;
+  char *candidate = strings.strings + strings.offsets[offset];
+  return strcmp(target, candidate) == 0 ?
+    strings.strings + strings.offsets[strings.count + offset] :
+    NULL;
 }
 
-tokens* tokenize(arena *allocator)
+static tokens* tokenize(arena *allocator)
 {
   char *p = allocator->data; // User input lies at the start of the arena.
 
   // Push a slice to the arena. Fill `tokens->v` by pushing tokens on the arena.
-  tokens *tks = ARENA_PUSH_TYPE(tokens);
+  tokens *tks = ALLOCATOR_PUSH_TYPE(tokens);
 
   size_t count = 0; // Keep count of tokens for `tokens->c`.
   while (*p)
@@ -397,7 +419,7 @@ tokens* tokenize(arena *allocator)
     // Multiple commands case
     if (c == '|')
     {
-        ARENA_PUSH_TYPE(token)->t = Pipe;
+        ALLOCATOR_PUSH_TYPE(token)->t = Pipe;
         p++;
     }
     else if (c == '&')
@@ -405,12 +427,12 @@ tokens* tokenize(arena *allocator)
       // Sequential
       if (*(p+1) == '&')
       {
-        ARENA_PUSH_TYPE(token)->t = Sequential;
+        ALLOCATOR_PUSH_TYPE(token)->t = Sequential;
         p += 2;
       }
       else
       {
-        ARENA_PUSH_TYPE(token)->t = Background;
+        ALLOCATOR_PUSH_TYPE(token)->t = Background;
         p++;
       }
     }
@@ -420,12 +442,12 @@ tokens* tokenize(arena *allocator)
       // Append case
       if (*(p+1) == '>')
       {
-        ARENA_PUSH_TYPE(token)->t = AppendOut;
+        ALLOCATOR_PUSH_TYPE(token)->t = AppendOut;
         p += 2;
       }
       else
       {
-        ARENA_PUSH_TYPE(token)->t = RedirectOut;
+        ALLOCATOR_PUSH_TYPE(token)->t = RedirectOut;
         p++;
       }
     }
@@ -435,12 +457,12 @@ tokens* tokenize(arena *allocator)
       // Append case
       if (*(p+2) == '>')
       {
-        ARENA_PUSH_TYPE(token)->t = AppendErr;
+        ALLOCATOR_PUSH_TYPE(token)->t = AppendErr;
         p += 3;
       }
       else
       {
-        ARENA_PUSH_TYPE(token)->t = RedirectErr;
+        ALLOCATOR_PUSH_TYPE(token)->t = RedirectErr;
         p += 2;
       }
     }
@@ -542,7 +564,7 @@ tokens* tokenize(arena *allocator)
         }
         *(write - 1) = '\0';
       }
-      ARENA_PUSH_TYPE(token)->ptr = CHAR_PTR_TO_TOKEN(start);
+      ALLOCATOR_PUSH_TYPE(token)->ptr = CHAR_PTR_TO_TOKEN(start);
     }
     count++;
   }
@@ -550,11 +572,11 @@ tokens* tokenize(arena *allocator)
   return tks;
 }
 
-commands *parse(tokens* T, arena *allocator)
+static commands *parse(tokens* T, arena *allocator)
 {
   // Push a slice to the arena. Fill `commands->v` by pushing args on the arena.
-  commands *cmds = ARENA_PUSH_TYPE(commands);
-  args *a = ARENA_PUSH_TYPE(args);
+  commands *cmds = ALLOCATOR_PUSH_TYPE(commands);
+  args *a = ALLOCATOR_PUSH_TYPE(args);
   a->redirection.t = Word;
 
   int i = 0, argc = 0, cmdc = 0, end = T->c;
@@ -563,7 +585,7 @@ commands *parse(tokens* T, arena *allocator)
     if (EXTRACT_TOKEN_TYPE(t) == Word)
     {
       // Fill `args->v` by pushing words to the arena.
-      *ARENA_PUSH_TYPE(char*) = EXTRACT_TOKEN_PTR(t);
+      *ALLOCATOR_PUSH_TYPE(char*) = EXTRACT_TOKEN_PTR(t);
       argc++;
     }
     // Redirections:
@@ -582,34 +604,34 @@ commands *parse(tokens* T, arena *allocator)
       a->c = argc;
       if (t.t == Pipe) // Do not add redirection for &&
         a->redirection.t = Pipe; // Pipes don't need a pointer to their destination.
-      *ARENA_PUSH_TYPE(char*) = NULL; // Null-terminated `args->v`.
+      *ALLOCATOR_PUSH_TYPE(char*) = NULL; // Null-terminated `args->v`.
       argc = 0;
       cmdc++;
-      a = ARENA_PUSH_TYPE(args);
+      a = ALLOCATOR_PUSH_TYPE(args);
       a->redirection.t = Word;
     }
   }
   assert(argc > 0 && "Ended a line with a && or | to nowhere.");
   a->c = argc;
-  *ARENA_PUSH_TYPE(char*) = NULL; // Null-terminated `args->v`.
+  *ALLOCATOR_PUSH_TYPE(char*) = NULL; // Null-terminated `args->v`.
   cmds->c = cmdc + 1;
 
   return cmds;
 }
 
 // Removes whitespace (' ', '\n', '\t')
-char* skip_spaces(char *p)
+static char* skip_spaces(char *p)
 {
   while (is_whitespace(*p++));
   return p - 1;
 }
 
-int is_whitespace(char c)
+static int is_whitespace(char c)
 {
   return c == ' ' || c == '\n' || c == '\t';
 }
 
-int is_decimal_num(char *c)
+static int is_decimal_num(char *c)
 {
   char d;
   while ((d = *c++))
@@ -618,160 +640,224 @@ int is_decimal_num(char *c)
   return 1;
 }
 
-void trie_init(arena_exponential *trie_arena, arena_exponential *strings_arena)
+// Returns the smallest index into `strings.offsets` such that
+// `strings.strings[strings.offsets[idx]]` starts with `target`
+// or -1 if no matches.
+static int32_t strings_binary_search(const char *target)
 {
-  T = trie_alloc(trie_arena);
+  pthread_once(&strings_once, build_autocomplete_strings);
+  int32_t left = 0, right = strings.count;
+  while (left < right)
+  {
+    int32_t m = (left + right) / 2;
+    int cmp = strcmp(target, strings.strings + strings.offsets[m]);
+    if (cmp < 0)
+      right = m;
+    else if (cmp > 0)
+      left = m + 1;
+    else return m;
+  }
+  return (left >= strings.count || (strncmp(target, strings.strings + strings.offsets[left], strlen(target)) != 0)) ? -1 : left;
+}
 
-  char *builtin_path = arena_exponential_push(strings_arena, alignof(char), 16);
-  char *default_msg = "a shell builtin";
-  memcpy(builtin_path, default_msg, 16);
-  assert((strlen(default_msg) + 1) == 16);
+static void* init_once(void *_)
+{
+  pthread_once(&strings_once, build_autocomplete_strings);
+  return 0;
+}
+
+static void build_autocomplete_strings()
+{
+  /******************************************************
+   * Initialize temporary arenas.
+   ******************************************************/
+  // Use a scratch arena for `temp_entry` and another for strings.
+  arena scratch_entry, scratch_string;
+  arena_init(&scratch_entry, 2 * MB);
+  arena_init(&scratch_string, 2 * MB);
+
+  /******************************************************
+   * Collect strings.
+   ******************************************************/
+  // Start with built-ins so they have precedence over PATH executables.
   for (int i = 0; i < Builtins_Size; i++)
-    trie_insert(trie_arena, T, builtins[i], builtin_path);
-
-  str PATH;
-  PATH.data = getenv("PATH");
-  assert(PATH.data && "PATH environment variable not found.");
-  PATH.len = strlen(PATH.data);
-
-  // PATH is immutable, so make a mutable copy.
-  arena scratch_arena = {0};
-  arena_init(&scratch_arena, PATH.len+1);
-  char *path = arena_push(&scratch_arena, alignof(char), PATH.len+1);
-  memcpy(path, PATH.data, PATH.len+1);
-
-  char *dir_str;
-  while ((dir_str = strsep(&path, PATH_LIST_SEPARATOR)))
   {
-    DIR *dir = opendir(dir_str);
-    struct dirent *entry;
-    if (dir)
+    temp_entry *e = ARENA_PUSH_TYPE(&scratch_entry, temp_entry);
+    size_t len = strlen(builtins[i]) + 1;
+    e->name = arena_push(&scratch_string, alignof(char), len);
+    memcpy(e->name, builtins[i], len);
+    e->full_path = NULL; // builtin marker
+  }
+
+  // Executables next.
+  char *PATH = getenv("PATH");
+  if (PATH)
+  {
+    // PATH is immutable, so make a mutable copy.
+    size_t path_len = strlen(PATH) + 1;
+    char *path = arena_push(&scratch_string, alignof(char), path_len);
+    memcpy(path, PATH, path_len);
+
+    char *dir;
+    while ((dir = strsep(&path, PATH_LIST_SEPARATOR)))
     {
-      while ((entry = readdir(dir)))
+      DIR *d = opendir(dir);
+      struct dirent *e;
+      if (d)
       {
-        if (entry->d_type == DT_REG)
+        while ((e = readdir(d)))
         {
-          unsigned long path_len = strlen(dir_str);
-          unsigned long executable_len = strlen(entry->d_name);
-          char *full_path = arena_exponential_push(strings_arena, alignof(char), executable_len + path_len + 2);
-          memcpy(full_path, dir_str, path_len);
-          full_path[path_len] = '/';
-          memcpy(full_path + path_len + 1, entry->d_name, executable_len + 1);
-          if (access(full_path, X_OK) == 0)
-            trie_insert(trie_arena, T, entry->d_name, full_path);
+          // Skip hidden files.
+          if (e->d_name[0] != '.')
+          {
+            size_t dlen = strlen(dir) + 1;
+            size_t elen = strlen(e->d_name) + 1;
+            size_t pop_len = scratch_string.len;
+            char *full = arena_push(&scratch_string, alignof(char), elen + dlen);
+            memcpy(full, dir, dlen);
+            full[dlen - 1] = '/';
+            memcpy(full + dlen, e->d_name, elen);
+
+            // Only store executable files.
+            struct stat st;
+            if (stat(full, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
+            {
+              temp_entry *entry = ARENA_PUSH_TYPE(&scratch_entry, temp_entry);
+              entry->name = arena_push(&scratch_string, alignof(char), elen);
+              memcpy(entry->name, e->d_name, elen);
+              entry->full_path = full;
+            }
+            else scratch_string.len = pop_len; // Discard non-executable file paths.
+          }
         }
+        closedir(d);
       }
-      closedir(dir);
     }
   }
 
-  arena_destroy(&scratch_arena);
-}
+  /******************************************************
+   * Sort entries by their corresponding strings.
+   * Keep it stable using arena addresses.
+   ******************************************************/
+  // TODO: implement radix sort.
+  // Make interface to `qsort()`.
+  size_t entry_count = scratch_entry.len / sizeof(temp_entry);
+  temp_entry *entries = (temp_entry *)scratch_entry.data;
+  qsort(entries, entry_count, sizeof(temp_entry), temp_entry_cmp);
 
-trie* trie_alloc(arena_exponential *allocator)
-{
-  trie *t = arena_exponential_push(allocator, alignof(trie), sizeof(trie));
-  memset(t->exist_bitset, 0, sizeof(t->exist_bitset));
-  t->full_path = NULL;
-  return t;
-}
-
-void trie_insert(arena_exponential *allocator, trie *t, char *entry, char *full_path)
-{
-  unsigned char c;
-  while ((c = *entry++))
-  {
-    int array_idx = c >> 6, bitset_idx = c & 63;
-    if (!(t->exist_bitset[array_idx] & ((uint64_t)1 << bitset_idx)))
+  /******************************************************
+   * Deduplicate in place and compute total string sizes.
+   ******************************************************/
+  temp_entry *read = entries, *write = entries;
+  size_t names_len_sum = 0, paths_len_sum = 0;
+  for (size_t i = 0; i < entry_count; i++, read++)
+    if (write == entries || (strcmp(read->name, (write - 1)->name) != 0))
     {
-      t->exist_bitset[array_idx] |= (uint64_t)1 << bitset_idx;
-      t->children[c] = trie_alloc(allocator);
+      *write++ = *read;
+      names_len_sum += strlen(read->name);
+      if (read->full_path) // Skip built-ins
+        paths_len_sum += strlen(read->full_path);
     }
-    t = t->children[c];
-  }
-  if (!t->full_path)
-    t->full_path = full_path;
-}
+  size_t count = write - entries;
 
-void trie_push_walk(trie *t, str curr, arena *allocator)
-{
-  assert(t && "we always check t->exist_bitset before recursing, so `t` cannot be null");
-  assert(curr.len < 256 && "buffer overflowed");
-  if (t->full_path)
+  /******************************************************
+   * Allocate permanent block.
+   ******************************************************/
+  const char *builtin_msg = "a shell builtin";
+  size_t builtin_msg_len = strlen(builtin_msg) + 1;
+  size_t strings_bytes = names_len_sum + count + builtin_msg_len + paths_len_sum + (count - Builtins_Size);
+  size_t aligned_length = ALIGN_UP(strings_bytes, alignof(int32_t));
+  size_t block_size = aligned_length + sizeof(int32_t) * 2 * count;
+  char *block = malloc(block_size);
+  assert(block && "malloc failed ¯\\_(ツ)_/¯");
+
+  strings.strings = block;
+  strings.offsets = (int32_t*)(block + aligned_length);
+  strings.count = count;
+
+  /******************************************************
+   * Store sorted strings and offsets.
+   ******************************************************/
+  // Memory layout:
+  // [strings(exe/builtins)]["a shell builtin"][strings(exe_full)][idx into part 1][idx into part 2/3]
+  // 5 pointers to fill / track.
+  char *names = block;
+  char *builtin_msg_ptr = block + names_len_sum + count;
+  // Done filling / tracking 1/5
+  memcpy(builtin_msg_ptr, builtin_msg, builtin_msg_len);
+  char *paths = builtin_msg_ptr + builtin_msg_len;
+  int32_t *name_offsets = strings.offsets;
+  int32_t *path_offsets = strings.offsets + count;
+
+  // i tracks index into offsets, done tracking 3/5
+  for (size_t i = 0; i < count; i++)
   {
-    curr.data[curr.len] = '\0';
-    *ARENA_PUSH_TYPE(char*) = strdup(curr.data);
-  }
-  for (int i = 0; i < ARRAY_COUNT(t->exist_bitset); i++)
-  {
-    uint64_t bitset = t->exist_bitset[i];
-    while (bitset)
+    temp_entry e = entries[i];
+    // Done filling 2/5
+    name_offsets[i] = names - block;
+    size_t nlen = strlen(e.name) + 1;
+    // Done filling 3/5
+    memcpy(names, e.name, nlen);
+    // Done tracking 4/5
+    names += nlen;
+
+    // Builtin flag
+    if (e.full_path)
     {
-      int LSB = LSB64(bitset);
-      unsigned char ascii_char = 64 * i + LSB;
-      curr.data[curr.len++] = ascii_char;
-      trie_push_walk(t->children[ascii_char], curr, allocator);
-      curr.len--;
-      bitset &= bitset - 1;
+      // Must also fill in the other branch!
+      path_offsets[i] = paths - block;
+      size_t plen = strlen(e.full_path) + 1;
+      // Done filling 4/5
+      memcpy(paths, e.full_path, plen);
+      // Done tracking 5/5
+      paths += plen;
     }
+    // Done filling 5/5
+    else path_offsets[i] = builtin_msg_ptr - block;
   }
+
+  /******************************************************
+   * Memory cleanup.
+   ******************************************************/
+  arena_destroy(&scratch_entry);
+  arena_destroy(&scratch_string);
 }
 
-trie* trie_get(trie *t, const char *target)
+static int temp_entry_cmp(const void *a, const void *b)
 {
-  unsigned char c = *target;
-  if (c)
-  {
-    int array_idx = c >> 6, bitset_idx = c & 63;
-    return ((t->exist_bitset[array_idx] & ((uint64_t)1 << bitset_idx)))
-      ? trie_get(t->children[c], target + 1)
-      : NULL;
-  }
-  else return t;
-}
+  const temp_entry *ea = a;
+  const temp_entry *eb = b;
+  int cmp = strcmp(ea->name, eb->name);
+  // Address implies insertion order in arena.
+  return cmp ? cmp : ea < eb ? -1 : ea > eb;
+};
 
-char **attempted_completion_function(const char *text, int start, int end)
+static char **attempted_completion_function(const char *text, int start, int end)
 {
   return start ? NULL : rl_completion_matches(text, completion_matches_generator);
 }
 
-char *completion_matches_generator(const char *text, int state)
+static char *completion_matches_generator(const char *text, int state)
 {
-  /****************************************************************************
-   * Store strings with malloc. Store pointers to them in the scratch arena.
-   * Get the count of strings by the length of the scratch arena.
-   * Destroy the scratch arena after returning the last pointer.
-   ****************************************************************************/
-  static arena scratch_ptr_arena = {0};
-  static size_t idx = 0;
+  static int32_t idx, len;
   if (!state)
   {
-    trie *t = trie_get(T, text);
-    // No match.
-    if (!t)
+    if ((idx = strings_binary_search(text)) == -1)
       return NULL;
     else
-    {
-      arena_init(&scratch_ptr_arena, ARENA_DEFAULT_SIZE);
-      char buffer[256];
-      str s = { buffer, strlen(text) };
-      memcpy(s.data, text, MIN(s.len, 256));
-      trie_push_walk(t, s, &scratch_ptr_arena);
-    }
+      len = strlen(text);
   }
-  if (idx * sizeof(char*) < scratch_ptr_arena.len)
-    return ((char **)scratch_ptr_arena.data)[idx++];
-  else
-  {
-    arena_destroy(&scratch_ptr_arena);
-    return NULL;
-  }
+  char *candidate = strings.strings + strings.offsets[idx++];
+  if (idx <= strings.count && strncmp(text, candidate, len) == 0)
+    return strdup(candidate);
+  return NULL;
 }
 
-void arena_init(arena *arena, size_t size)
+static void arena_init(arena *arena, size_t size)
 {
   arena->data = malloc(size);
   arena->capacity = size;
+  arena->len = 0;
   if (!arena->data)
   {
     fprintf(stderr, "Failed initializing arena with %zu bytes.\n", size);
@@ -779,9 +865,9 @@ void arena_init(arena *arena, size_t size)
   }
 }
 
-void arena_destroy(arena *arena) { free(arena->data); }
+static void arena_destroy(arena *arena) { free(arena->data); }
 
-void* arena_push(arena *arena, size_t alignment, size_t size)
+static void* arena_push(arena *arena, size_t alignment, size_t size)
 {
   size_t bit_mask = alignment - 1;
   assert((alignment != 0) && ((alignment & bit_mask) == 0) && "alignment must be a power of two");
@@ -793,7 +879,7 @@ void* arena_push(arena *arena, size_t alignment, size_t size)
   return arena->data + aligned_length;
 }
 
-void* arena_exponential_push(arena_exponential *arena, size_t alignment, size_t size)
+static void* arena_exponential_push(arena_exponential *arena, size_t alignment, size_t size)
 {
   // Get the MSB of `arena->len / arena->first_block_capacity`.
   int block_idx = MSB64(arena->len / arena->first_block_capacity);
@@ -827,4 +913,4 @@ void* arena_exponential_push(arena_exponential *arena, size_t alignment, size_t 
   return arena->room[block_idx] + aligned_length - (block_idx ? capacity >> 1 : 0);
 }
 
-void arena_reset(arena *arena) { arena->len = 0; }
+static void arena_reset(arena *arena) { arena->len = 0; }
