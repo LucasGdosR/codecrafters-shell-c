@@ -159,24 +159,24 @@ typedef struct temp_entry {
   FUNCTIONS
 =================================================================================================*/
 
-static char* find_executable(char *target);
-static tokens* tokenize(arena *allocator);
-static commands *parse(tokens* T, arena *allocator);
+static const char* find_executable(const char *target);
+static tokens* tokenize(arena *restrict allocator);
+static commands *parse(const tokens *restrict T, arena *restrict allocator);
 
-static void builtin_cd(args *a, arena *allocator);
-static void builtin_pwd(args *a, arena *allocator);
-static void builtin_echo(args *a, arena *allocator);
-static void builtin_type(args *a, arena *allocator);
-static void builtin_exit(args *a, arena *allocator);
+static void builtin_cd(const args *a, arena *allocator);
+static void builtin_pwd(const args *a, arena *allocator);
+static void builtin_echo(const args *a, arena *allocator);
+static void builtin_type(const args *a, arena *allocator);
+static void builtin_exit(const args *a, arena *allocator);
 
 static int is_whitespace(char c);
-static int is_decimal_num(char *c);
+static int is_decimal_num(const char *c);
 static char* skip_spaces(char *p);
 
 static void arena_init(arena *arena, size_t size);
 static void arena_destroy(arena *arena);
-static void* arena_push(arena *arena, size_t alignment, size_t size);
-static void* arena_exponential_push(arena_exponential *a, size_t alignment, size_t size);
+static void* arena_push(arena *restrict arena, size_t alignment, size_t size);
+static void* arena_exponential_push(arena_exponential *restrict a, size_t alignment, size_t size);
 static void arena_reset(arena *arena);
 
 static void build_autocomplete_strings();
@@ -192,11 +192,11 @@ static char* completion_matches_generator(const char *text, int state);
 =================================================================================================*/
 
 /* Mappings from enum to string / functions. */
-static char *builtins[Builtins_Size] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
-static void (*builtin_functions[Builtins_Size])(args *, arena *) = {
+static const char *builtins[Builtins_Size] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
+static void (*const builtin_functions[Builtins_Size])(const args *, arena *) = {
   [CD]=builtin_cd, [PWD]=builtin_pwd, [Echo]=builtin_echo, [Type]=builtin_type, [Exit]=builtin_exit};
 /* Global sorted string list to interface with GNU Readline. */
-permanent_strings strings = {0};
+static permanent_strings strings;
 static pthread_once_t strings_once = PTHREAD_ONCE_INIT;
 
 /*=================================================================================================
@@ -234,6 +234,7 @@ int main(int argc, char *argv[])
 
     // Read:
     tokens *tks = tokenize(&repl_arena);
+    if (tks->c == 0) continue;
     commands *cmds = parse(tks, &repl_arena);
     args *a = cmds->v;
 
@@ -295,7 +296,7 @@ int main(int argc, char *argv[])
       }
       if (!is_builtin) // executable
       {
-        char *full_path = find_executable(a->v[0]);
+        const char *full_path = find_executable(a->v[0]);
         if (full_path)
         {
           pid_t pid = fork();
@@ -331,7 +332,7 @@ int main(int argc, char *argv[])
   return 0;
 }
 
-static void builtin_cd(args *a, arena *allocator)
+static void builtin_cd(const args *a, arena *allocator)
 {
   if ((a->c == 1) || (a->c == 2 && (strcmp(a->v[1], "~")) == 0))
   {
@@ -346,7 +347,7 @@ static void builtin_cd(args *a, arena *allocator)
   printf("mysh: cd: too many arguments\n");
 }
 
-static void builtin_pwd(args *a, arena *allocator)
+static void builtin_pwd(const args *a, arena *allocator)
 {
   char *cwd = arena_push(allocator, alignof(char), MAX_CWD_SIZE);
   char *ptr = getcwd(cwd, MAX_CWD_SIZE);
@@ -354,7 +355,7 @@ static void builtin_pwd(args *a, arena *allocator)
   printf("%s\n", cwd);
 }
 
-static void builtin_echo(args *a, arena *allocator)
+static void builtin_echo(const args *a, arena *allocator)
 {
   size_t end = a->c - 1;
   if (end)
@@ -365,12 +366,12 @@ static void builtin_echo(args *a, arena *allocator)
   }
 }
 
-static void builtin_type(args *a, arena *allocator)
+static void builtin_type(const args *a, arena *allocator)
 {
   for (int i = 1; i < a->c; i++)
   {
     char *arg = a->v[i];
-    char *full_path = find_executable(arg);
+    const char *full_path = find_executable(arg);
     if (full_path)
       printf("%s is %s\n", arg, full_path);
     // Default case:
@@ -378,7 +379,7 @@ static void builtin_type(args *a, arena *allocator)
   }
 }
 
-static void builtin_exit(args *a, arena *allocator)
+static void builtin_exit(const args *a, arena *allocator)
 {
   if (a->c == 1)
     exit(0);
@@ -390,7 +391,7 @@ static void builtin_exit(args *a, arena *allocator)
     exit((unsigned char) atoll(a->v[1]));
 }
 
-static char* find_executable(char *target)
+static const char* find_executable(const char *target)
 {
   int32_t offset = strings_binary_search(target);
   if (offset == -1)
@@ -401,7 +402,7 @@ static char* find_executable(char *target)
     NULL;
 }
 
-static tokens* tokenize(arena *allocator)
+static tokens* tokenize(arena *restrict allocator)
 {
   char *p = allocator->data; // User input lies at the start of the arena.
 
@@ -572,7 +573,7 @@ static tokens* tokenize(arena *allocator)
   return tks;
 }
 
-static commands *parse(tokens* T, arena *allocator)
+static commands *parse(const tokens *restrict T, arena *restrict allocator)
 {
   // Push a slice to the arena. Fill `commands->v` by pushing args on the arena.
   commands *cmds = ALLOCATOR_PUSH_TYPE(commands);
@@ -631,7 +632,7 @@ static int is_whitespace(char c)
   return c == ' ' || c == '\n' || c == '\t';
 }
 
-static int is_decimal_num(char *c)
+static int is_decimal_num(const char *c)
 {
   char d;
   while ((d = *c++))
@@ -705,12 +706,12 @@ static void build_autocomplete_strings()
       struct dirent *e;
       if (d)
       {
+        size_t dlen = strlen(dir) + 1;
         while ((e = readdir(d)))
         {
           // Skip hidden files.
           if (e->d_name[0] != '.')
           {
-            size_t dlen = strlen(dir) + 1;
             size_t elen = strlen(e->d_name) + 1;
             size_t pop_len = scratch_string.len;
             char *full = arena_push(&scratch_string, alignof(char), elen + dlen);
@@ -720,7 +721,8 @@ static void build_autocomplete_strings()
 
             // Only store executable files.
             struct stat st;
-            if (stat(full, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)))
+            if (  ( (e->d_type == DT_REG) && (access(full, X_OK) == 0)  ) || // Fast path
+             (  (e->d_type == DT_REG && e->d_type == DT_UNKNOWN) && (stat(full, &st) == 0) && (S_ISREG(st.st_mode) ) && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH) ) ) )
             {
               temp_entry *entry = ARENA_PUSH_TYPE(&scratch_entry, temp_entry);
               entry->name = arena_push(&scratch_string, alignof(char), elen);
@@ -739,7 +741,7 @@ static void build_autocomplete_strings()
    * Sort entries by their corresponding strings.
    * Keep it stable using arena addresses.
    ******************************************************/
-  // TODO: implement radix sort.
+  // TODO (long term): implement radix sort. This takes 1 ms already, but as practice.
   // Make interface to `qsort()`.
   size_t entry_count = scratch_entry.len / sizeof(temp_entry);
   temp_entry *entries = (temp_entry *)scratch_entry.data;
@@ -867,7 +869,7 @@ static void arena_init(arena *arena, size_t size)
 
 static void arena_destroy(arena *arena) { free(arena->data); }
 
-static void* arena_push(arena *arena, size_t alignment, size_t size)
+static void* arena_push(arena *restrict arena, size_t alignment, size_t size)
 {
   size_t bit_mask = alignment - 1;
   assert((alignment != 0) && ((alignment & bit_mask) == 0) && "alignment must be a power of two");
@@ -879,7 +881,7 @@ static void* arena_push(arena *arena, size_t alignment, size_t size)
   return arena->data + aligned_length;
 }
 
-static void* arena_exponential_push(arena_exponential *arena, size_t alignment, size_t size)
+static void* arena_exponential_push(arena_exponential *restrict arena, size_t alignment, size_t size)
 {
   // Get the MSB of `arena->len / arena->first_block_capacity`.
   int block_idx = MSB64(arena->len / arena->first_block_capacity);
