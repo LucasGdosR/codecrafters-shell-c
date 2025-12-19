@@ -179,6 +179,7 @@ static int is_decimal_num(const char *restrict c);
 static char* skip_spaces(char *restrict p);
 
 static void arena_init(arena *restrict arena, size_t size);
+static void arena_exponential_init(arena_exponential *restrict arena, size_t size);
 static void arena_destroy(arena *restrict arena);
 static void* arena_push(arena *restrict arena, size_t alignment, size_t size);
 static void* arena_exponential_push(arena_exponential *restrict a, size_t alignment, size_t size);
@@ -203,6 +204,8 @@ static void (*const builtin_functions[Builtins_Size])(const args *, arena *) = {
 /* Global sorted string list to interface with GNU Readline. */
 static permanent_strings strings;
 static pthread_once_t strings_once = PTHREAD_ONCE_INIT;
+/* Avoid passing this arena to every built-in by making it global. */
+static arena history_pointers;
 
 /*=================================================================================================
   IMPLEMENTATIONS
@@ -225,16 +228,26 @@ int main(int argc, char *argv[])
   // GNU Readline interface.
   rl_attempted_completion_function = attempted_completion_function;
 
+  // history builtin.
+  arena_init(&history_pointers, ARENA_DEFAULT_SIZE);
+  arena_exponential history_strings;
+  arena_exponential_init(&history_strings, ARENA_DEFAULT_SIZE);
+
   // REPL
   char *input;
   while ((input = readline("$ ")))
   {
-    ssize_t line_len = strlen(input);
     arena_reset(&repl_arena);
+    ssize_t line_len = strlen(input) + 1;
+
+    char *history_string = arena_exponential_push(&history_strings, alignof(char), line_len);
+    memcpy(history_string, input, line_len);
+    *ARENA_PUSH_TYPE(&history_pointers, char*) = history_string;
+
     // TODO: reuse `readline`'s buffer instead of copying it to arena.
-    char *line_buffer = arena_push(&repl_arena, alignof(char), line_len + 2); // Double NUL terminator simplifies tokenizing.
-    memcpy(line_buffer, input, line_len + 1);
-    *(line_buffer + line_len + 1 ) = '\0';
+    char *line_buffer = arena_push(&repl_arena, alignof(char), line_len + 1); // Double NUL terminator simplifies tokenizing.
+    memcpy(line_buffer, input, line_len);
+    *(line_buffer + line_len) = '\0';
     free(input);
 
     // Read:
@@ -302,7 +315,7 @@ int main(int argc, char *argv[])
               execv(full_path, a->v);
               exit(EXIT_FAILURE);
             }
-            else printf("%s: command not found\n", a->v[0]);
+            else fprintf(stderr, "%s: command not found\n", a->v[0]);
             exit(127); // Command not found exit code.
           }
           // Parent
@@ -399,7 +412,7 @@ static const args* execute_single_command(const args *restrict a, arena *restric
         assert((w != -1) && "`waitpid` failed.");
       }
     }
-    else printf("%s: command not found\n", a->v[0]);
+    else fprintf(stderr, "%s: command not found\n", a->v[0]);
   }
   // Restore redirection.
   if (a->redirection.t != Word)
@@ -418,12 +431,12 @@ static void builtin_cd(const args *restrict a, arena *restrict allocator)
     char *home = getenv("HOME");
     assert(home && "HOME environment variable not found.");
     if (chdir(home))
-      printf("cd: %s: No such file or directory\n", a->v[1]);
+      fprintf(stderr, "cd: %s: No such file or directory\n", a->v[1]);
   }
   else if (a->c == 2 && chdir(a->v[1]))
-    printf("cd: %s: No such file or directory\n", a->v[1]);
+    fprintf(stderr, "cd: %s: No such file or directory\n", a->v[1]);
   else if (a->c >= 3)
-  printf("mysh: cd: too many arguments\n");
+  perror("lush: cd: too many arguments\n");
 }
 
 static void builtin_pwd(const args *restrict a, arena *restrict allocator)
@@ -454,7 +467,7 @@ static void builtin_type(const args *restrict a, arena *restrict allocator)
     if (full_path)
       printf("%s is %s\n", arg, full_path);
     // Default case:
-    else printf("%s: not found\n", arg);
+    else fprintf(stderr, "%s: not found\n", arg);
   }
 }
 
@@ -465,14 +478,39 @@ static void builtin_exit(const args *restrict a, arena *restrict allocator)
   else if (!is_decimal_num(a->v[1]))
     exit(2);
   else if (a->c > 2)
-    printf("mysh: exit: too many arguments\n");
+    perror("lush: exit: too many arguments\n");
   else
     exit((unsigned char) atoll(a->v[1]));
 }
 
 static void builtin_history(const args *restrict a, arena *restrict allocator)
 {
+  if (a->c > 2)
+  {
+    perror("lush: history: too many arguments\n");
+    return;
+  }
 
+  int count = history_pointers.len / sizeof(char*);
+  int limit = 0;
+  if (a->c == 2)
+  {
+    if (!is_decimal_num(a->v[1]))
+    {
+      fprintf(stderr, "lush: history: %s: numeric argument required\n", a->v[1]);
+      return;
+    }
+    limit = atoi(a->v[1]);
+    if (limit < 0)
+    {
+      fprintf(stderr, "lush: history: %s: invalid option", a->v[1]);
+      return;
+    }
+    limit = count - limit;
+  }
+
+  for (int i = limit; i < count; i++)
+    printf("%5d  %s\n", i+1, ((char**)history_pointers.data)[i]);
 }
 
 static const char* find_executable(const char *restrict target)
@@ -719,6 +757,8 @@ static int is_whitespace(char c)
 static int is_decimal_num(const char *restrict c)
 {
   char d;
+  if (*c == '-')
+    c++;
   while ((d = *c++))
     if (d < '0' || d > '9')
       return 0;
@@ -945,6 +985,20 @@ static void arena_init(arena *restrict arena, size_t size)
   arena->capacity = size;
   arena->len = 0;
   if (!arena->data)
+  {
+    fprintf(stderr, "Failed initializing arena with %zu bytes.\n", size);
+    exit(1);
+  }
+}
+
+static void arena_exponential_init(arena_exponential *restrict arena, size_t size)
+{
+  arena->room[0] = malloc(size);
+  arena->first_block_capacity = size;
+  arena->len = 0;
+  for (int i = 1; i < ARRAY_COUNT(arena->room); i++)
+    arena->room[i] = NULL;
+  if (!arena->room[0])
   {
     fprintf(stderr, "Failed initializing arena with %zu bytes.\n", size);
     exit(1);
