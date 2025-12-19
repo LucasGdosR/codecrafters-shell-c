@@ -55,6 +55,7 @@ enum Builtins {
   Echo,
   Type,
   Exit,
+  History,
   Builtins_Size,
 };
 
@@ -171,6 +172,7 @@ static void builtin_pwd(const args *restrict a, arena *restrict allocator);
 static void builtin_echo(const args *restrict a, arena *restrict allocator);
 static void builtin_type(const args *restrict a, arena *restrict allocator);
 static void builtin_exit(const args *restrict a, arena *restrict allocator);
+static void builtin_history(const args *restrict a, arena *restrict allocator);
 
 static int is_whitespace(char c);
 static int is_decimal_num(const char *restrict c);
@@ -195,9 +197,9 @@ static char* completion_matches_generator(const char *restrict text, int state);
 =================================================================================================*/
 
 /* Mappings from enum to string / functions. */
-static const char *builtins[Builtins_Size] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit"};
+static const char *builtins[Builtins_Size] = {[CD]="cd", [PWD]="pwd", [Echo]="echo", [Type]="type", [Exit]="exit", [History]="history"};
 static void (*const builtin_functions[Builtins_Size])(const args *, arena *) = {
-  [CD]=builtin_cd, [PWD]=builtin_pwd, [Echo]=builtin_echo, [Type]=builtin_type, [Exit]=builtin_exit};
+  [CD]=builtin_cd, [PWD]=builtin_pwd, [Echo]=builtin_echo, [Type]=builtin_type, [Exit]=builtin_exit, [History]=builtin_history};
 /* Global sorted string list to interface with GNU Readline. */
 static permanent_strings strings;
 static pthread_once_t strings_once = PTHREAD_ONCE_INIT;
@@ -279,7 +281,6 @@ int main(int argc, char *argv[])
               dup2(pipes[i][1], STDOUT_FILENO);
 
             // Close duplicated pipes.
-            // Is this actually needed? Won't exiting the process close them anyway?
             for (int i = 0; i < pipeline_length; i++)
             {
               close(pipes[i][0]);
@@ -467,6 +468,11 @@ static void builtin_exit(const args *restrict a, arena *restrict allocator)
     printf("mysh: exit: too many arguments\n");
   else
     exit((unsigned char) atoll(a->v[1]));
+}
+
+static void builtin_history(const args *restrict a, arena *restrict allocator)
+{
+
 }
 
 static const char* find_executable(const char *restrict target)
