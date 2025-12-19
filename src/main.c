@@ -42,6 +42,8 @@
 #define MB (KB << 10)
 #define GB (MB << 10)
 #define ALIGN_UP(n, alignment) (((n) + (alignment) - 1) & ~((alignment) - 1))
+// +1 for null termination of `args->v`s.
+#define ADVANCE_ARGS(a) (args*)((char*)(a) + sizeof(args) + ((a)->c + 1) * sizeof(char*))
 
 /*=================================================================================================
   ENUMS
@@ -159,33 +161,34 @@ typedef struct temp_entry {
   FUNCTIONS
 =================================================================================================*/
 
-static const char* find_executable(const char *target);
-static tokens* tokenize(arena *restrict allocator);
-static commands *parse(const tokens *restrict T, arena *restrict allocator);
+static const char* find_executable(const char *restrict target);
+static const tokens* tokenize(arena *restrict allocator);
+static const commands* parse(const tokens *restrict T, arena *restrict allocator);
+static const args* execute_single_command(const args *restrict a, arena *restrict allocator);
 
-static void builtin_cd(const args *a, arena *allocator);
-static void builtin_pwd(const args *a, arena *allocator);
-static void builtin_echo(const args *a, arena *allocator);
-static void builtin_type(const args *a, arena *allocator);
-static void builtin_exit(const args *a, arena *allocator);
+static void builtin_cd(const args *restrict a, arena *restrict allocator);
+static void builtin_pwd(const args *restrict a, arena *restrict allocator);
+static void builtin_echo(const args *restrict a, arena *restrict allocator);
+static void builtin_type(const args *restrict a, arena *restrict allocator);
+static void builtin_exit(const args *restrict a, arena *restrict allocator);
 
 static int is_whitespace(char c);
-static int is_decimal_num(const char *c);
-static char* skip_spaces(char *p);
+static int is_decimal_num(const char *restrict c);
+static char* skip_spaces(char *restrict p);
 
-static void arena_init(arena *arena, size_t size);
-static void arena_destroy(arena *arena);
+static void arena_init(arena *restrict arena, size_t size);
+static void arena_destroy(arena *restrict arena);
 static void* arena_push(arena *restrict arena, size_t alignment, size_t size);
 static void* arena_exponential_push(arena_exponential *restrict a, size_t alignment, size_t size);
-static void arena_reset(arena *arena);
+static void arena_reset(arena *restrict arena);
 
 static void build_autocomplete_strings();
 static int temp_entry_cmp(const void *a, const void *b);
-static int32_t strings_binary_search(const char *target);
+static int32_t strings_binary_search(const char *restrict target);
 static void* init_once(void*);
 
-static char** attempted_completion_function(const char *text, int start, int end);
-static char* completion_matches_generator(const char *text, int state);
+static char** attempted_completion_function(const char *restrict text, int start, int end);
+static char* completion_matches_generator(const char *restrict text, int state);
 
 /*=================================================================================================
   GLOBALS
@@ -233,106 +236,181 @@ int main(int argc, char *argv[])
     free(input);
 
     // Read:
-    tokens *tks = tokenize(&repl_arena);
+    const tokens *tks = tokenize(&repl_arena);
     if (tks->c == 0) continue;
-    commands *cmds = parse(tks, &repl_arena);
-    args *a = cmds->v;
+    const commands *cmds = parse(tks, &repl_arena);
+    const args *a = cmds->v;
 
     // Eval-Print:
-    for (int i = 0; i < cmds->c; i++)
+    int i = 0;
+    while (i < cmds->c)
     {
-      if (!a->c) continue;
-
-      // Redirect.
-      int saved_fd, target_fd;
-      FILE *fp;
-      if (a->redirection.t != Word)
+      int pipeline_length = 0;
       {
-        char *modes;
-        switch (EXTRACT_TOKEN_TYPE(a->redirection)) {
-          case RedirectOut:
-            target_fd = STDOUT_FILENO;
-            modes = "w";
-            break;
-          case RedirectErr:
-            target_fd = STDERR_FILENO;
-            modes = "w";
-            break;
-          case AppendOut:
-            target_fd = STDOUT_FILENO;
-            modes = "a";
-            break;
-          case AppendErr:
-            target_fd = STDERR_FILENO;
-            modes = "a";
-            break;
-          case Pipe:
-            printf("Pipe redirection not yet implemented.\n");
-            break;
-          default:
-            assert(0 && "Unreachable: invalid redirection.");
-            break;
+        const args *temp = a;
+        while (temp->redirection.t == Pipe)
+        {
+          temp = ADVANCE_ARGS(temp);
+          pipeline_length++;
         }
-        saved_fd = dup(target_fd);
-        assert((saved_fd != -1) && "Failed `dup` for redirection.");
-        intptr_t ptr = a->redirection.ptr >> TOKEN_SHIFT;
-        char *dst = (char*)ptr;
-        enum Token_Type t = a->redirection.t & TOKEN_TYPE_MASK;
-        fp = fopen(EXTRACT_TOKEN_PTR(a->redirection), modes);
-        assert(fp && "Failed opening file for redirection.");
-        int fd = fileno(fp);
-        assert((fd != -1) && "Failed `fileno`.");
-        int err = dup2(fd, target_fd);
-        assert((err != -1) && "Failed `dup2` for starting redirection.");
       }
-
-      // Builtins:
-      int is_builtin = 0;
-      for (int i = 0; i < Builtins_Size; i++) if (strcmp(a->v[0], builtins[i]) == 0)
+      if (pipeline_length == 0)
+        a = execute_single_command(a, &repl_arena);
+      else
       {
-        builtin_functions[i](a, &repl_arena);
-        is_builtin = 1;
-        break;
-      }
-      if (!is_builtin) // executable
-      {
-        const char *full_path = find_executable(a->v[0]);
-        if (full_path)
+        // TODO (long term): figure out how pipes and redirection should interact and implement that.
+        int (*pipes)[2] = arena_push(&repl_arena, alignof(int[2]), pipeline_length * sizeof(int[2]));
+        for (int i = 0; i < pipeline_length; i++)
+          pipe(pipes[i]);
+        pid_t *children = arena_push(&repl_arena, alignof(pid_t), (pipeline_length + 1) * sizeof(pid_t));
+        for (int i = 0; i <= pipeline_length; i++, a = ADVANCE_ARGS(a))
         {
           pid_t pid = fork();
-          assert((pid != -1) && "`fork` failed.");
+          assert((pid != -1) && "`fork` failed in pipeline.");
           // Child process
           if (pid == 0)
           {
-            execv(full_path, a->v);
-            exit(EXIT_FAILURE);
+            // Redirect stdin for all but the first.
+            if (i > 0)
+              dup2(pipes[i-1][0], STDIN_FILENO);
+            // Redirect stdout for all but the last.
+            // TODO: check `a->redirection.t` for file redirections?
+            if (i < pipeline_length)
+              dup2(pipes[i][1], STDOUT_FILENO);
+
+            // Close duplicated pipes.
+            // Is this actually needed? Won't exiting the process close them anyway?
+            for (int i = 0; i < pipeline_length; i++)
+            {
+              close(pipes[i][0]);
+              close(pipes[i][1]);
+            }
+
+            // Builtin
+            for (int i = 0; i < Builtins_Size; i++) if (strcmp(a->v[0], builtins[i]) == 0)
+            {
+              builtin_functions[i](a, &repl_arena);
+              exit(0);
+            }
+
+            // Executable
+
+            const char *full_path = find_executable(a->v[0]);
+            if (full_path)
+            {
+              execv(full_path, a->v);
+              exit(EXIT_FAILURE);
+            }
+            else printf("%s: command not found\n", a->v[0]);
+            exit(127); // Command not found exit code.
           }
-          // Original process
-          else
-          {
-            int wstat;
-            pid_t w = waitpid(pid, &wstat, 0);
-            assert((w != -1) && "`waitpid` failed.");
-          }
+          // Parent
+          children[i] = pid;
         }
-        else printf("%s: command not found\n", a->v[0]);
+        // Close all pipes on parent
+        for (int i = 0; i < pipeline_length; i++)
+        {
+          close(pipes[i][0]);
+          close(pipes[i][1]);
+        }
+        for (int i = 0; i <= pipeline_length; i++)
+        {
+          int wstat;
+          pid_t w = waitpid(children[i], &wstat, 0);
+          assert((w != 1) && "`waitpid` failed in pipeline");
+        }
       }
-      // Restore redirection.
-      if (a->redirection.t != Word)
-      {
-        dup2(saved_fd, target_fd);
-        close(saved_fd);
-        fclose(fp);
-      }
-      // Advance args pointer to the next args.
-      a = (args*)((char*)a + sizeof(args) + (a->c + 1) * sizeof(char*)); // +1 for null termination of `args->v`s.
+      i += pipeline_length + 1;
     }
   }
 
   return 0;
 }
 
-static void builtin_cd(const args *a, arena *allocator)
+static const args* execute_single_command(const args *restrict a, arena *restrict allocator)
+{
+  // Redirect.
+  int saved_fd, target_fd;
+  FILE *fp;
+  if (a->redirection.t != Word)
+  {
+    char *modes;
+    switch (EXTRACT_TOKEN_TYPE(a->redirection)) {
+      case RedirectOut:
+        target_fd = STDOUT_FILENO;
+        modes = "w";
+        break;
+      case RedirectErr:
+        target_fd = STDERR_FILENO;
+        modes = "w";
+        break;
+      case AppendOut:
+        target_fd = STDOUT_FILENO;
+        modes = "a";
+        break;
+      case AppendErr:
+        target_fd = STDERR_FILENO;
+        modes = "a";
+        break;
+      default:
+        assert(0 && "Unreachable: invalid redirection.");
+        break;
+    }
+    saved_fd = dup(target_fd);
+    assert((saved_fd != -1) && "Failed `dup` for redirection.");
+    intptr_t ptr = a->redirection.ptr >> TOKEN_SHIFT;
+    char *dst = (char*)ptr;
+    enum Token_Type t = a->redirection.t & TOKEN_TYPE_MASK;
+    fp = fopen(EXTRACT_TOKEN_PTR(a->redirection), modes);
+    assert(fp && "Failed opening file for redirection.");
+    int fd = fileno(fp);
+    assert((fd != -1) && "Failed `fileno`.");
+    int err = dup2(fd, target_fd);
+    assert((err != -1) && "Failed `dup2` for starting redirection.");
+  }
+
+  // Builtins:
+  int is_builtin = 0;
+  for (int i = 0; i < Builtins_Size; i++) if (strcmp(a->v[0], builtins[i]) == 0)
+  {
+    builtin_functions[i](a, allocator);
+    is_builtin = 1;
+    break;
+  }
+  if (!is_builtin) // executable
+  {
+    const char *full_path = find_executable(a->v[0]);
+    if (full_path)
+    {
+      pid_t pid = fork();
+      assert((pid != -1) && "`fork` failed.");
+      // Child process
+      if (pid == 0)
+      {
+        execv(full_path, a->v);
+        exit(EXIT_FAILURE);
+      }
+      // Original process
+      else
+      {
+        int wstat;
+        pid_t w = waitpid(pid, &wstat, 0);
+        assert((w != -1) && "`waitpid` failed.");
+      }
+    }
+    else printf("%s: command not found\n", a->v[0]);
+  }
+  // Restore redirection.
+  if (a->redirection.t != Word)
+  {
+    dup2(saved_fd, target_fd);
+    close(saved_fd);
+    fclose(fp);
+  }
+  return ADVANCE_ARGS(a);
+}
+
+static void builtin_cd(const args *restrict a, arena *restrict allocator)
 {
   if ((a->c == 1) || (a->c == 2 && (strcmp(a->v[1], "~")) == 0))
   {
@@ -347,7 +425,7 @@ static void builtin_cd(const args *a, arena *allocator)
   printf("mysh: cd: too many arguments\n");
 }
 
-static void builtin_pwd(const args *a, arena *allocator)
+static void builtin_pwd(const args *restrict a, arena *restrict allocator)
 {
   char *cwd = arena_push(allocator, alignof(char), MAX_CWD_SIZE);
   char *ptr = getcwd(cwd, MAX_CWD_SIZE);
@@ -355,7 +433,7 @@ static void builtin_pwd(const args *a, arena *allocator)
   printf("%s\n", cwd);
 }
 
-static void builtin_echo(const args *a, arena *allocator)
+static void builtin_echo(const args *restrict a, arena *restrict allocator)
 {
   size_t end = a->c - 1;
   if (end)
@@ -366,7 +444,7 @@ static void builtin_echo(const args *a, arena *allocator)
   }
 }
 
-static void builtin_type(const args *a, arena *allocator)
+static void builtin_type(const args *restrict a, arena *restrict allocator)
 {
   for (int i = 1; i < a->c; i++)
   {
@@ -379,7 +457,7 @@ static void builtin_type(const args *a, arena *allocator)
   }
 }
 
-static void builtin_exit(const args *a, arena *allocator)
+static void builtin_exit(const args *restrict a, arena *restrict allocator)
 {
   if (a->c == 1)
     exit(0);
@@ -391,7 +469,7 @@ static void builtin_exit(const args *a, arena *allocator)
     exit((unsigned char) atoll(a->v[1]));
 }
 
-static const char* find_executable(const char *target)
+static const char* find_executable(const char *restrict target)
 {
   int32_t offset = strings_binary_search(target);
   if (offset == -1)
@@ -402,7 +480,7 @@ static const char* find_executable(const char *target)
     NULL;
 }
 
-static tokens* tokenize(arena *restrict allocator)
+static const tokens* tokenize(arena *restrict allocator)
 {
   char *p = allocator->data; // User input lies at the start of the arena.
 
@@ -573,7 +651,7 @@ static tokens* tokenize(arena *restrict allocator)
   return tks;
 }
 
-static commands *parse(const tokens *restrict T, arena *restrict allocator)
+static const commands *parse(const tokens *restrict T, arena *restrict allocator)
 {
   // Push a slice to the arena. Fill `commands->v` by pushing args on the arena.
   commands *cmds = ALLOCATOR_PUSH_TYPE(commands);
@@ -621,7 +699,7 @@ static commands *parse(const tokens *restrict T, arena *restrict allocator)
 }
 
 // Removes whitespace (' ', '\n', '\t')
-static char* skip_spaces(char *p)
+static char* skip_spaces(char *restrict p)
 {
   while (is_whitespace(*p++));
   return p - 1;
@@ -632,7 +710,7 @@ static int is_whitespace(char c)
   return c == ' ' || c == '\n' || c == '\t';
 }
 
-static int is_decimal_num(const char *c)
+static int is_decimal_num(const char *restrict c)
 {
   char d;
   while ((d = *c++))
@@ -644,7 +722,7 @@ static int is_decimal_num(const char *c)
 // Returns the smallest index into `strings.offsets` such that
 // `strings.strings[strings.offsets[idx]]` starts with `target`
 // or -1 if no matches.
-static int32_t strings_binary_search(const char *target)
+static int32_t strings_binary_search(const char *restrict target)
 {
   pthread_once(&strings_once, build_autocomplete_strings);
   int32_t left = 0, right = strings.count;
@@ -834,12 +912,12 @@ static int temp_entry_cmp(const void *a, const void *b)
   return cmp ? cmp : ea < eb ? -1 : ea > eb;
 };
 
-static char **attempted_completion_function(const char *text, int start, int end)
+static char **attempted_completion_function(const char *restrict text, int start, int end)
 {
   return start ? NULL : rl_completion_matches(text, completion_matches_generator);
 }
 
-static char *completion_matches_generator(const char *text, int state)
+static char *completion_matches_generator(const char *restrict text, int state)
 {
   static int32_t idx, len;
   if (!state)
@@ -855,7 +933,7 @@ static char *completion_matches_generator(const char *text, int state)
   return NULL;
 }
 
-static void arena_init(arena *arena, size_t size)
+static void arena_init(arena *restrict arena, size_t size)
 {
   arena->data = malloc(size);
   arena->capacity = size;
@@ -867,7 +945,7 @@ static void arena_init(arena *arena, size_t size)
   }
 }
 
-static void arena_destroy(arena *arena) { free(arena->data); }
+static void arena_destroy(arena *restrict arena) { free(arena->data); }
 
 static void* arena_push(arena *restrict arena, size_t alignment, size_t size)
 {
@@ -915,4 +993,4 @@ static void* arena_exponential_push(arena_exponential *restrict arena, size_t al
   return arena->room[block_idx] + aligned_length - (block_idx ? capacity >> 1 : 0);
 }
 
-static void arena_reset(arena *arena) { arena->len = 0; }
+static void arena_reset(arena *restrict arena) { arena->len = 0; }

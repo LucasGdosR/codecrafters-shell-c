@@ -11,10 +11,10 @@ LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.
 - Redirects stdout / stderr to files, supporting both truncate and append modes;
 - File, built-ins and executables autocomplete w/ TAB using GNU Readline;
 - Sequential commands with && in a single line;
+- Pipes;
 
 ### TODO
 
-- Pipes;
 - Background executions;
 - History built-in;
 
