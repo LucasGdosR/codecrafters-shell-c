@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <readline/history.h>
 #include <readline/readline.h>
 #include <stdalign.h>
 #include <stddef.h>
@@ -204,8 +205,6 @@ static void (*const builtin_functions[Builtins_Size])(const args *, arena *) = {
 /* Global sorted string list to interface with GNU Readline. */
 static permanent_strings strings;
 static pthread_once_t strings_once = PTHREAD_ONCE_INIT;
-/* Avoid passing this arena to every built-in by making it global. */
-static arena history_pointers;
 
 /*=================================================================================================
   IMPLEMENTATIONS
@@ -229,20 +228,17 @@ int main(int argc, char *argv[])
   rl_attempted_completion_function = attempted_completion_function;
 
   // history builtin.
-  arena_init(&history_pointers, ARENA_DEFAULT_SIZE);
-  arena_exponential history_strings;
-  arena_exponential_init(&history_strings, ARENA_DEFAULT_SIZE);
+  using_history();
 
   // REPL
   char *input;
   while ((input = readline("$ ")))
   {
+    if (*skip_spaces(input) == '\0')
+      continue;
+    add_history(input);
     arena_reset(&repl_arena);
     ssize_t line_len = strlen(input) + 1;
-
-    char *history_string = arena_exponential_push(&history_strings, alignof(char), line_len);
-    memcpy(history_string, input, line_len);
-    *ARENA_PUSH_TYPE(&history_pointers, char*) = history_string;
 
     // TODO: reuse `readline`'s buffer instead of copying it to arena.
     char *line_buffer = arena_push(&repl_arena, alignof(char), line_len + 1); // Double NUL terminator simplifies tokenizing.
@@ -252,7 +248,6 @@ int main(int argc, char *argv[])
 
     // Read:
     const tokens *tks = tokenize(&repl_arena);
-    if (tks->c == 0) continue;
     const commands *cmds = parse(tks, &repl_arena);
     const args *a = cmds->v;
 
@@ -491,7 +486,7 @@ static void builtin_history(const args *restrict a, arena *restrict allocator)
     return;
   }
 
-  int count = history_pointers.len / sizeof(char*);
+  HIST_ENTRY **the_list = history_list();
   int limit = 0;
   if (a->c == 2)
   {
@@ -506,11 +501,11 @@ static void builtin_history(const args *restrict a, arena *restrict allocator)
       fprintf(stderr, "lush: history: %s: invalid option", a->v[1]);
       return;
     }
-    limit = count - limit;
+    limit = history_length - limit;
   }
 
-  for (int i = limit; i < count; i++)
-    printf("%5d  %s\n", i+1, ((char**)history_pointers.data)[i]);
+  for (int i = limit; the_list[i]; i++)
+    printf("%5d  %s\n", i+1, the_list[i]->line);
 }
 
 static const char* find_executable(const char *restrict target)
