@@ -23,4 +23,4 @@ LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.
 - Sorted string list implementation for fast autocomplete with low memory overhead (history has a trie implementation with higher memory overhead);
 - Does initialization in a background thread to let the user type right away;
 
-**Note**: Head over to [codecrafters.io](https://codecrafters.io) to try the challenge.
+**Note**: Head over to [codecrafters.io](https://app.codecrafters.io/r/glorious-mallard-480161) to try the challenge.
