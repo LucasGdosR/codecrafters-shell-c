@@ -12,11 +12,11 @@ LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.
 - File, built-ins and executables autocomplete w/ TAB using GNU Readline;
 - Sequential commands with && in a single line;
 - Pipes;
+- History;
 
 ### TODO
 
 - Background executions;
-- History built-in;
 
 ## Highlights
 

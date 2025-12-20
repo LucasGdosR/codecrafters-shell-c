@@ -205,6 +205,7 @@ static void (*const builtin_functions[Builtins_Size])(const args *, arena *) = {
 /* Global sorted string list to interface with GNU Readline. */
 static permanent_strings strings;
 static pthread_once_t strings_once = PTHREAD_ONCE_INIT;
+static int session_command_count = 0;
 
 /*=================================================================================================
   IMPLEMENTATIONS
@@ -229,6 +230,7 @@ int main(int argc, char *argv[])
 
   // history builtin.
   using_history();
+  read_history(getenv("HISTFILE"));
 
   // REPL
   char *input;
@@ -237,6 +239,7 @@ int main(int argc, char *argv[])
     if (*skip_spaces(input) == '\0')
       continue;
     add_history(input);
+    session_command_count++;
     arena_reset(&repl_arena);
     ssize_t line_len = strlen(input) + 1;
 
@@ -468,44 +471,60 @@ static void builtin_type(const args *restrict a, arena *restrict allocator)
 
 static void builtin_exit(const args *restrict a, arena *restrict allocator)
 {
-  if (a->c == 1)
-    exit(0);
-  else if (!is_decimal_num(a->v[1]))
-    exit(2);
-  else if (a->c > 2)
+  if (a->c > 2)
     perror("lush: exit: too many arguments\n");
   else
-    exit((unsigned char) atoll(a->v[1]));
+  {
+    append_history(session_command_count, getenv("HISTFILE"));
+    if (a->c == 1)
+      exit(0);
+    else if (!is_decimal_num(a->v[1]))
+      exit(2);
+    else
+      exit((unsigned char) atoll(a->v[1]));
+  }
 }
 
 static void builtin_history(const args *restrict a, arena *restrict allocator)
 {
-  if (a->c > 2)
-  {
+  if (a->c > 3)
     perror("lush: history: too many arguments\n");
-    return;
-  }
-
-  HIST_ENTRY **the_list = history_list();
-  int limit = 0;
-  if (a->c == 2)
+  // Print history.
+  else if (a->c < 3)
   {
-    if (!is_decimal_num(a->v[1]))
+    HIST_ENTRY **the_list = history_list();
+    int limit = 0;
+    if (a->c == 2)
     {
-      fprintf(stderr, "lush: history: %s: numeric argument required\n", a->v[1]);
-      return;
+      if (!is_decimal_num(a->v[1]))
+      {
+        fprintf(stderr, "lush: history: %s: numeric argument required\n", a->v[1]);
+        return;
+      }
+      limit = atoi(a->v[1]);
+      if (limit < 0)
+      {
+        fprintf(stderr, "lush: history: %s: invalid option", a->v[1]);
+        return;
+      }
+      limit = history_length - limit;
     }
-    limit = atoi(a->v[1]);
-    if (limit < 0)
-    {
-      fprintf(stderr, "lush: history: %s: invalid option", a->v[1]);
-      return;
-    }
-    limit = history_length - limit;
-  }
 
-  for (int i = limit; the_list[i]; i++)
-    printf("%5d  %s\n", i+1, the_list[i]->line);
+    for (int i = limit; the_list[i]; i++)
+      printf("%5d  %s\n", i+1, the_list[i]->line);
+  }
+  // (a->c == 3)
+  // Read / write / append file.
+  else if (strcmp(a->v[1], "-r") == 0)
+    read_history(a->v[2]);
+  else if (strcmp(a->v[1], "-w") == 0)
+    write_history(a->v[2]);
+  else if (strcmp(a->v[1], "-a") == 0)
+  {
+    append_history(session_command_count, a->v[2]);
+    session_command_count = 0;
+  }
+  else fprintf(stderr, "lush: history: %s: invalid option", a->v[1]);
 }
 
 static const char* find_executable(const char *restrict target)
