@@ -1,6 +1,6 @@
 # LUSH: Lucas' Shell
 
-LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.codecrafters.io/courses/shell/overview).
+LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.codecrafters.io/courses/shell/overview). Currently 43 / 43 stages complete, waiting for the next extension.
 
 > In this challenge, you'll build your own POSIX compliant shell that's capable of interpreting shell commands, running external programs and builtin commands like cd, pwd, echo and more. Along the way, you'll learn about shell command parsing, REPLs, builtin commands, and more.
 
@@ -13,10 +13,6 @@ LUSH is my take on CodeCrafters' ["Build Your Own Shell" Challenge](https://app.
 - Sequential commands with && in a single line;
 - Pipes;
 - History;
-
-### TODO
-
-- Background executions;
 
 ## Highlights
 
